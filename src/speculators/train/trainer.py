@@ -46,6 +46,10 @@ class TrainerConfig(NamedTuple):
     checkpoint_freq: int = 1
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
+    cp_mode: Literal["none", "context_parallel"] = "none"
+    cp_size: int = 1
+    cp_rank: int = 0
+    cp_mesh: object | None = None
 
 
 class Trainer:
@@ -63,6 +67,10 @@ class Trainer:
         self.val_loader = val_loader
         self.is_distributed = config.is_distributed
         self.resume_from_checkpoint = config.resume_from_checkpoint
+        self.cp_mode = config.cp_mode
+        self.cp_size = config.cp_size
+        self.cp_rank = config.cp_rank
+        self.cp_mesh = config.cp_mesh
         checkpointer_class = (
             DistributedCheckpointer if self.is_distributed else SingleGPUCheckpointer
         )
@@ -116,6 +124,10 @@ class Trainer:
             full_state_dict = self.model.state_dict()
 
         apply_fully_sharded(self.model)
+        if self.cp_mode != "none" and self.cp_size > 1 and self.cp_mesh is None:
+            raise RuntimeError(
+                "Context parallel is configured but no device mesh was initialized."
+            )
 
         if load_checkpoint:
             restored_from_best = self.init_best_val_loss_from_checkpoint_best()
@@ -242,9 +254,13 @@ class Trainer:
                 for k, v in batch.items()
             }
 
-            _draft_tokens, loss, metrics = self.model(
-                **gpu_batch, **self.config.train_call_kwargs
-            )
+            model_call_kwargs = dict(self.config.train_call_kwargs)
+            if self.cp_mode == "context_parallel" and self.cp_size > 1:
+                model_call_kwargs["_cp_mesh"] = self.cp_mesh
+                model_call_kwargs["_cp_size"] = self.cp_size
+                model_call_kwargs["_cp_rank"] = self.cp_rank
+
+            _draft_tokens, loss, metrics = self.model(**gpu_batch, **model_call_kwargs)
 
             self.opt.zero_grad()
             loss.backward()
@@ -287,9 +303,12 @@ class Trainer:
                 for k, v in batch.items()
             }
 
-            _draft_tokens, _loss, metrics = self.model(
-                **gpu_batch, **self.config.val_call_kwargs
-            )
+            model_call_kwargs = dict(self.config.val_call_kwargs)
+            if self.cp_mode == "context_parallel" and self.cp_size > 1:
+                model_call_kwargs["_cp_mesh"] = self.cp_mesh
+                model_call_kwargs["_cp_size"] = self.cp_size
+                model_call_kwargs["_cp_rank"] = self.cp_rank
+            _draft_tokens, _loss, metrics = self.model(**gpu_batch, **model_call_kwargs)
 
             if self.is_distributed:
                 for m in metrics.values():

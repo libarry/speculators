@@ -4,6 +4,7 @@ import torch
 from torch.nn.attention.flex_attention import BlockMask
 
 from speculators.models.eagle3.attention import (
+    block_mask_to_dense_attention_mask,
     create_combined_mask_mod,
     extend_mask_for_draft_tokens,
 )
@@ -137,3 +138,20 @@ def test_extend_mask_for_draft_tokens(kv_num_blocks, kv_indices, expected_kv_ind
         )
 
     assert extended_mask.mask_mod == block_mask.mask_mod
+
+
+def test_block_mask_to_dense_attention_mask_cp_kv_expansion():
+    lengths = torch.tensor([4], dtype=torch.long)
+    block_mask = BlockMask.from_kv_blocks(
+        kv_num_blocks=torch.tensor([[[1]]], dtype=torch.int32),
+        kv_indices=torch.tensor([[[[0]]]], dtype=torch.int32),
+        mask_mod=create_combined_mask_mod(lengths, total_seq_len=4),
+    )
+
+    dense_mask = block_mask_to_dense_attention_mask(
+        block_mask,
+        device=torch.device("cpu"),
+        dtype=torch.bool,
+        cp_size=4,
+    )
+    assert dense_mask.shape == (1, 1, 4, 16)

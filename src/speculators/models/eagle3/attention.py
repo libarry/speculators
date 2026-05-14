@@ -1,11 +1,9 @@
 # ruff: noqa: ERA001
-from typing import cast
-
 import torch
+import torch.nn.functional as F
 from torch.nn.attention.flex_attention import (
     BlockMask,
     and_masks,
-    flex_attention,
     or_masks,
 )
 from transformers.modeling_utils import AttentionInterface
@@ -124,17 +122,33 @@ def extend_mask_for_draft_tokens(block_mask):
 
 
 def block_mask_to_dense_attention_mask(
-    block_mask: BlockMask, device: torch.device, dtype: torch.dtype
+    block_mask: BlockMask, device: torch.device, dtype: torch.dtype, cp_size: int = 1
 ):
-    attention_mask = torch.ones(block_mask.shape, device=device, dtype=dtype)
+    if cp_size < 1:
+        raise ValueError(f"`cp_size` must be >= 1, got {cp_size}.")
 
-    for q_idx in range(attention_mask.shape[2]):
-        attention_mask[0, 0, q_idx, :] = block_mask.mask_mod(
-            torch.zeros(1, device=device, dtype=torch.long),
-            torch.zeros(1, device=device, dtype=torch.long),
-            torch.ones(1, device=device, dtype=torch.long) * q_idx,
-            torch.arange(attention_mask.shape[3], device=device, dtype=torch.long),
-        )
+    batch_size, num_heads, q_len, kv_len_local = block_mask.shape
+    kv_len = kv_len_local * cp_size
+    attention_mask = torch.ones(
+        (batch_size, num_heads, q_len, kv_len),
+        device=device,
+        dtype=dtype,
+    )
+    kv_idx = torch.arange(kv_len, device=device, dtype=torch.long)
+    kv_idx_for_mask = kv_idx % kv_len_local
+
+    for batch_idx in range(batch_size):
+        b = torch.tensor([batch_idx], device=device, dtype=torch.long)
+        for head_idx in range(num_heads):
+            h = torch.tensor([head_idx], device=device, dtype=torch.long)
+            for q_idx in range(q_len):
+                q = torch.tensor([q_idx], device=device, dtype=torch.long)
+                attention_mask[batch_idx, head_idx, q_idx, :] = block_mask.mask_mod(
+                    b,
+                    h,
+                    q,
+                    kv_idx_for_mask,
+                )
     return attention_mask
 
 
@@ -155,16 +169,26 @@ def flex_attention_forward(
     key = key.contiguous()
     value = value.contiguous()
 
-    flex_attention_output = flex_attention(
+    cp_size = int(_kwargs.get("_cp_size", 1))
+    sdpa_attention_mask = attention_mask
+    if isinstance(attention_mask, BlockMask):
+        sdpa_attention_mask = block_mask_to_dense_attention_mask(
+            attention_mask,
+            device=query.device,
+            dtype=torch.bool,
+            cp_size=cp_size,
+        )
+
+    attention_output = F.scaled_dot_product_attention(
         query,
         key,
         value,
-        score_mod=None,
-        block_mask=attention_mask,
+        attn_mask=sdpa_attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
         enable_gqa=enable_gqa,
         scale=scaling,
     )
-    attention_output: torch.Tensor = cast("torch.Tensor", flex_attention_output)
     attention_output = attention_output.transpose(1, 2).contiguous()
     return attention_output, None
 

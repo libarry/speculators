@@ -92,7 +92,17 @@ def split_files(datapath: str, ratio: float = 0.9, seed: int = 0):
     file_list = list_files(datapath)
     random.shuffle(file_list)
     num_files = len(file_list)
+    if num_files == 0:
+        return [], []
+
     num_train_files = int(num_files * ratio)
+    # int(n * 0.9) is 0 when n == 1, which leaves an empty training set and breaks
+    # Eagle3SampleFileDataset. Keep at least one file for training when possible.
+    if num_train_files == 0:
+        num_train_files = 1
+    if num_train_files >= num_files:
+        num_train_files = num_files - 1 if num_files > 1 else num_files
+
     train_files = file_list[:num_train_files]
     val_files = file_list[num_train_files:]
     return train_files, val_files
@@ -400,6 +410,19 @@ class Eagle3SampleFileDataset(BaseEagle3Dataset):
                 "`file_list` to use a list of explicit file paths."
             )
 
+        if len(file_list) == 0:
+            hint = (
+                datapath
+                if datapath is not None
+                else "the provided file list"
+            )
+            raise ValueError(
+                "No .pt training samples found under "
+                f"{hint!r}. Run data generation first, or point --data-path "
+                "at the directory that contains generated data_*.pt files "
+                "(e.g. output/gen/<dataset_name>/)."
+            )
+
         self.data: list[str] = file_list
 
         # Delay super init so that `_compute_approx_lengths` has required data
@@ -449,7 +472,7 @@ class Eagle3SampleFileDataset(BaseEagle3Dataset):
     def _get_raw_data(self, index):
         return standardize_data_v1(
             torch.load(
-                self.data[index], mmap=True, weights_only=True, map_location="cpu"
+                self.data[index], weights_only=True, map_location="cpu"
             )
         )
 

@@ -1,5 +1,6 @@
 # ruff: noqa: ERA001
 import copy
+from contextlib import nullcontext
 import warnings
 from typing import ClassVar
 
@@ -17,6 +18,52 @@ from speculators.models.eagle3.attention import (
 from speculators.models.eagle3.model_definitions import model_classes
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.utils.loading import load_model_layers
+
+
+def _build_document_ids(lengths: torch.Tensor, total_seq_len: int) -> torch.Tensor:
+    if lengths.numel() == 0:
+        return torch.full((1, total_seq_len), -1, dtype=torch.long, device=lengths.device)
+
+    lengths_1d = lengths.to(dtype=torch.long).flatten()
+    positive_lengths = lengths_1d[lengths_1d > 0]
+    if positive_lengths.numel() == 0:
+        return torch.full((1, total_seq_len), -1, dtype=torch.long, device=lengths.device)
+
+    total_tokens = int(positive_lengths.sum().item())
+    if total_tokens > total_seq_len:
+        raise ValueError(
+            "Invalid `lengths`: sum(lengths) cannot exceed total_seq_len. "
+            f"sum(lengths)={total_tokens}, total_seq_len={total_seq_len}."
+        )
+
+    doc_ids = torch.repeat_interleave(
+        torch.arange(
+            positive_lengths.shape[0], device=lengths.device, dtype=torch.long
+        ),
+        positive_lengths,
+    )
+    if doc_ids.shape[0] < total_seq_len:
+        pad = torch.full(
+            (total_seq_len - doc_ids.shape[0],), -1, dtype=torch.long, device=lengths.device
+        )
+        doc_ids = torch.cat([doc_ids, pad], dim=0)
+    return doc_ids.unsqueeze(0)
+
+
+def _extract_lengths_from_document_ids(document_ids: torch.Tensor) -> torch.Tensor:
+    if document_ids.ndim == 2:
+        document_ids = document_ids.squeeze(0)
+    if document_ids.ndim != 1:
+        raise ValueError(
+            "document_ids must be rank-1 or rank-2 tensor with a batch dimension of 1."
+        )
+
+    valid_ids = document_ids[document_ids >= 0]
+    if valid_ids.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=document_ids.device)
+
+    # Count occurrences per document id in the local CP shard.
+    return torch.bincount(valid_ids, minlength=int(valid_ids.max().item()) + 1)
 
 
 def align_for_step(
@@ -397,6 +444,9 @@ class Eagle3DraftModel(SpeculatorModel):
         use_off_policy_tokens: bool = False,
         **kwargs,
     ):
+        cp_mesh = kwargs.pop("_cp_mesh", None)
+        _cp_size = kwargs.pop("_cp_size", 1)
+        _cp_rank = kwargs.pop("_cp_rank", 0)
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
 
@@ -408,122 +458,162 @@ class Eagle3DraftModel(SpeculatorModel):
             ).unsqueeze(0)
             # shape: [1, total_seq_len]
 
-        past_key_values = DynamicCache(config=self.config.transformer_layer_config)
+        cp_context = nullcontext()
+        cp_document_ids = None
+        if cp_mesh is not None and _cp_size > 1:
+            try:
+                from torch.distributed.tensor.experimental import context_parallel
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Context parallel was requested but torch does not expose "
+                    "`torch.distributed.tensor.experimental.context_parallel`."
+                ) from exc
 
-        combined_mask_mod = create_combined_mask_mod(lengths.to(device), total_seq_len)
-        # Note: Attention mask is stored as a BlockMask object
-        attention_mask = create_block_mask(
-            combined_mask_mod,
-            B=None,
-            H=None,
-            Q_LEN=total_seq_len,
-            KV_LEN=total_seq_len,
-            device=device,
-        )
+            cp_buffers = [hidden_states, input_ids, position_ids]
+            cp_buffer_seq_dims = [1, 1, 1]
+            if loss_mask is not None:
+                cp_buffers.append(loss_mask)
+                cp_buffer_seq_dims.append(1)
+            if verifier_last_hidden_states is not None:
+                cp_buffers.append(verifier_last_hidden_states)
+                cp_buffer_seq_dims.append(1)
+            if lengths is not None:
+                cp_document_ids = _build_document_ids(lengths, total_seq_len)
+                cp_buffers.append(cp_document_ids)
+                cp_buffer_seq_dims.append(1)
 
-        if self.input_norm is not None:
-            hidden_states = self.input_norm(hidden_states)
-        hidden_states = self.fc(hidden_states)
-        # shape: [1, total_seq_len, hidden_size]
-
-        original_input_ids = input_ids.detach().clone()
-        return_loss = verifier_last_hidden_states is not None
-        if return_loss:
-            with torch.no_grad():
-                targets = self.verifier_lm_head(
-                    self.verifier_norm(verifier_last_hidden_states)
-                )
-                # shape: [1, total_seq_len, draft_vocab_size]
-            loss = torch.tensor(0.0, device=device)
-
-            # prev_correct is a boolean tensor that is True for tokens that have been
-            # correctly predicted on all previous ttt_steps.
-            # Initialized to True if the token is included in the loss_mask
-            # or if there is no loss_mask
-            prev_correct = (
-                loss_mask.clone()
-                if loss_mask is not None
-                else torch.ones(1, total_seq_len, device=device, dtype=torch.bool)
+            cp_context = context_parallel(
+                cp_mesh,
+                buffers=cp_buffers,
+                buffer_seq_dims=cp_buffer_seq_dims,
+                no_restore_buffers=set(cp_buffers),
             )
-            metrics = {}
 
-        draft_tokens = []
-        for ttt_step in range(ttt_steps):
-            with torch.no_grad():
-                input_embeds = self.embed_tokens(input_ids)
-                # shape: [1, total_seq_len, hidden_size]
-            cache_position = torch.arange(
-                ttt_step * total_seq_len,
-                (ttt_step + 1) * total_seq_len,
-                dtype=torch.long,
+        with cp_context:
+            if cp_document_ids is not None:
+                lengths = _extract_lengths_from_document_ids(cp_document_ids)
+            total_seq_len = hidden_states.shape[1]
+            layer_call_kwargs = dict(kwargs)
+            if cp_mesh is not None and _cp_size > 1:
+                layer_call_kwargs["_cp_size"] = _cp_size
+                layer_call_kwargs["_cp_rank"] = _cp_rank
+
+            past_key_values = DynamicCache(config=self.config.transformer_layer_config)
+
+            combined_mask_mod = create_combined_mask_mod(lengths.to(device), total_seq_len)
+            # Note: Attention mask is stored as a BlockMask object
+            attention_mask = create_block_mask(
+                combined_mask_mod,
+                B=None,
+                H=None,
+                Q_LEN=total_seq_len,
+                KV_LEN=total_seq_len,
                 device=device,
             )
-            # shape: [total_seq_len]
 
-            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
-            # shape: [1, total_seq_len, 2 * hidden_size]
+            if self.input_norm is not None:
+                hidden_states = self.input_norm(hidden_states)
+            hidden_states = self.fc(hidden_states)
+            # shape: [1, total_seq_len, hidden_size]
 
-            position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-            for decoder_layer in self.layers:
-                hidden_states = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
-
-            logits = self.lm_head(self.norm(hidden_states))
-            # shape: [1, total_seq_len, draft_vocab_size]
-
+            original_input_ids = input_ids.detach().clone()
+            return_loss = verifier_last_hidden_states is not None
             if return_loss:
-                s_loss, s_metrics = compute_metrics(
-                    logits,
-                    targets,
-                    loss_mask,
-                    prev_correct,
-                    ttt_step,
-                    ttt_step_loss_decay,
-                )
-                loss += s_loss
-                metrics.update(s_metrics)
+                with torch.no_grad():
+                    targets = self.verifier_lm_head(
+                        self.verifier_norm(verifier_last_hidden_states)
+                    )
+                    # shape: [1, total_seq_len, draft_vocab_size]
+                loss = torch.tensor(0.0, device=device)
 
-            input_ids = torch.argmax(logits, dim=-1)
-            draft_tokens.append(input_ids.detach().clone())
-            # shape: [1, total_seq_len]
-            # Use d2t to map draft tokens to verifier tokens.
-            # Must be in verifier vocabulary space because we use the full verifier
-            # vocabulary in the embedding.
-            if self.d2t is not None:
-                input_ids = input_ids + self.d2t[input_ids]  # type: ignore[index]
-
-            if use_off_policy_tokens:
-                # Overwrite input_ids with ground truth tokens
-                # shift input_ids by 1 to the left and pad with 0
-                # note: inputs_ids no longer line up with verifier_last_hidden_states
-                # the draft logits generated from the padded tokens are ignored
-                # and sliced out for loss calculation
-                input_ids = torch.cat(
-                    [
-                        original_input_ids[:, 1 + ttt_step :],
-                        original_input_ids.new_zeros(1, 1 + ttt_step),
-                    ],
-                    dim=-1,
+                # prev_correct is a boolean tensor that is True for tokens that have been
+                # correctly predicted on all previous ttt_steps.
+                # Initialized to True if the token is included in the loss_mask
+                # or if there is no loss_mask
+                prev_correct = (
+                    loss_mask.clone()
+                    if loss_mask is not None
+                    else torch.ones(1, total_seq_len, device=device, dtype=torch.bool)
                 )
+                metrics = {}
+
+            draft_tokens = []
+            for ttt_step in range(ttt_steps):
+                with torch.no_grad():
+                    input_embeds = self.embed_tokens(input_ids)
+                    # shape: [1, total_seq_len, hidden_size]
+                cache_position = torch.arange(
+                    ttt_step * total_seq_len,
+                    (ttt_step + 1) * total_seq_len,
+                    dtype=torch.long,
+                    device=device,
+                )
+                # shape: [total_seq_len]
+
+                hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+                # shape: [1, total_seq_len, 2 * hidden_size]
+
+                position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+                for decoder_layer in self.layers:
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **layer_call_kwargs,
+                    )
+
+                logits = self.lm_head(self.norm(hidden_states))
+                # shape: [1, total_seq_len, draft_vocab_size]
+
+                if return_loss:
+                    s_loss, s_metrics = compute_metrics(
+                        logits,
+                        targets,
+                        loss_mask,
+                        prev_correct,
+                        ttt_step,
+                        ttt_step_loss_decay,
+                    )
+                    loss += s_loss
+                    metrics.update(s_metrics)
+
+                input_ids = torch.argmax(logits, dim=-1)
+                draft_tokens.append(input_ids.detach().clone())
+                # shape: [1, total_seq_len]
+                # Use d2t to map draft tokens to verifier tokens.
+                # Must be in verifier vocabulary space because we use the full verifier
+                # vocabulary in the embedding.
+                if self.d2t is not None:
+                    input_ids = input_ids + self.d2t[input_ids]  # type: ignore[index]
+
+                if use_off_policy_tokens:
+                    # Overwrite input_ids with ground truth tokens
+                    # shift input_ids by 1 to the left and pad with 0
+                    # note: inputs_ids no longer line up with verifier_last_hidden_states
+                    # the draft logits generated from the padded tokens are ignored
+                    # and sliced out for loss calculation
+                    input_ids = torch.cat(
+                        [
+                            original_input_ids[:, 1 + ttt_step :],
+                            original_input_ids.new_zeros(1, 1 + ttt_step),
+                        ],
+                        dim=-1,
+                    )
+                    # shape: [1, total_seq_len]
+
+                attention_mask = extend_mask_for_draft_tokens(attention_mask)
+                position_ids = position_ids + 1
                 # shape: [1, total_seq_len]
 
-            attention_mask = extend_mask_for_draft_tokens(attention_mask)
-            position_ids = position_ids + 1
-            # shape: [1, total_seq_len]
-
-        if return_loss:
-            metrics["loss"] = loss.detach().clone()
-            return draft_tokens, loss, metrics
-        else:
-            return draft_tokens
+            if return_loss:
+                metrics["loss"] = loss.detach().clone()
+                return draft_tokens, loss, metrics
+            else:
+                return draft_tokens
 
     @classmethod
     def from_training_args(

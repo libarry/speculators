@@ -212,7 +212,10 @@ def main(args: argparse.Namespace):
     )
 
     # Setup distributed training
-    local_rank, world_size, rank, is_distributed = maybe_setup_distributed()
+    local_rank, world_size, rank, is_distributed, cp_config = maybe_setup_distributed(
+        cp_size=args.cp_size,
+        cp_mode=args.cp_mode,
+    )
     if not hasattr(torch, args.hidden_states_dtype):
         raise ValueError(
             "--hidden-states-dtype must be a dtype attribute of torch. e.g. `bfloat16`"
@@ -262,11 +265,20 @@ def main(args: argparse.Namespace):
             transform=noise_transform,
             hidden_states_dtype=hidden_states_dtype,
         )
-        val_dataset: BaseEagle3Dataset = Eagle3SampleFileDataset(
-            file_list=val_files,
-            max_len=args.total_seq_len,
-            hidden_states_dtype=hidden_states_dtype,
-        )
+        if val_files:
+            val_dataset: BaseEagle3Dataset | None = Eagle3SampleFileDataset(
+                file_list=val_files,
+                max_len=args.total_seq_len,
+                hidden_states_dtype=hidden_states_dtype,
+            )
+        else:
+            val_dataset = None
+            warnings.warn(
+                "No validation split for legacy .pt data (e.g. only one sample "
+                "file); skipping the validation dataloader.",
+                category=UserWarning,
+                stacklevel=2,
+            )
     else:
         train_dataset = Eagle3ArrowDataset(
             datapath=args.data_path,
@@ -300,14 +312,17 @@ def main(args: argparse.Namespace):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
     )
-    val_loader = setup_dataloader(
-        val_dataset,
-        world_size,
-        local_rank,
-        transformer_layer_config.hidden_size,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
+    if val_dataset is not None:
+        val_loader = setup_dataloader(
+            val_dataset,
+            world_size,
+            local_rank,
+            transformer_layer_config.hidden_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+    else:
+        val_loader = None
 
     # Get trainer kwargs from model class
     train_call_kwargs, val_call_kwargs = model_class.get_trainer_kwargs(**vars(args))
@@ -328,6 +343,10 @@ def main(args: argparse.Namespace):
         checkpoint_freq=args.checkpoint_freq,
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
+        cp_mode=cp_config.mode,
+        cp_size=cp_config.size,
+        cp_rank=cp_config.rank,
+        cp_mesh=cp_config.mesh,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -477,6 +496,25 @@ def parse_args():
         action="store_true",
         default=False,
         help="Sets cuda to deterministic mode. This may impact performance.",
+    )
+    parser.add_argument(
+        "--cp-mode",
+        type=str,
+        default="none",
+        choices=["none", "context_parallel"],
+        help=(
+            "Context parallel mode. "
+            "Use 'context_parallel' with torchrun to shard sequence dimension."
+        ),
+    )
+    parser.add_argument(
+        "--cp-size",
+        type=int,
+        default=1,
+        help=(
+            "Context parallel group size. "
+            "Set >1 to enable context parallel sequence sharding."
+        ),
     )
     parser.add_argument(
         "--use-off-policy-tokens",

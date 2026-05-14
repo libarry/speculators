@@ -133,6 +133,8 @@ class TrainArgs(NamedTuple):
     scheduler_total_steps: int | _NS = _NOTSET
     scheduler_num_cosine_cycles: float | _NS = _NOTSET
     norm_before_fc: bool | _NS = _NOTSET
+    cp_mode: str | _NS = _NOTSET
+    cp_size: int | _NS = _NOTSET
 
 
 ### END OF SCRIPT ARGUMENTS ###

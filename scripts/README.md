@@ -239,6 +239,14 @@ To run in a single-node multi-GPU distributed training setup with FSDP, the scri
 torchrun --standalone --nproc_per_node=<num_gpus>  scripts/train.py
 ```
 
+To enable context parallel sequence sharding (CP) with FSDP, set `--cp-mode context_parallel` and a CP group size:
+
+```bash
+torchrun --standalone --nproc_per_node=<num_gpus> scripts/train.py \
+    --cp-mode context_parallel \
+    --cp-size <cp_group_size>
+```
+
 For single GPU training (useful for debugging), the script can be run directly:
 
 ```bash
@@ -268,6 +276,11 @@ The scripts has the following optional arguments:
 - `--t2d-path`: The path to the t2d tensor. Defaults to `t2d.npy`.
 - `--ttt-steps`: The number of TTT steps to use. Defaults to 3.
 - `--ttt-step-loss-decay`: The loss decay factor to use for the TTT steps. Defaults to 1.0.
+- `--cp-mode`: Context parallel mode. Use `context_parallel` to enable CP, or `none` to disable it (default).
+- `--cp-size`: Context parallel group size. Must be 1 when `--cp-mode none`. For CP mode, must divide `WORLD_SIZE`.
+
+> [!NOTE]
+> CP support is currently CUDA-only and requires launching with `torchrun`. If CP cannot be initialized in the current runtime, training fails fast with an actionable error message.
 
 ### Example Command
 
