@@ -241,6 +241,7 @@ class ArrowDataset(BaseDataset):
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        concat_all_hidden_layers: bool = False,
     ):
         """Initialize the ArrowDataset.
         Args:
@@ -249,6 +250,9 @@ class ArrowDataset(BaseDataset):
             arrow dataset.
             transform: The transform to apply to the data.
             hidden_states_dtype: The dtype of the hidden states.
+            concat_all_hidden_layers: When True, concatenate every exported hidden
+                state layer (PARD-2). When False, use the EAGLE-style split of
+                aux layers vs last layer.
         """
         self.data = load_from_disk(datapath)
         self.start_file_idx = 0
@@ -277,6 +281,7 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self.concat_all_hidden_layers = concat_all_hidden_layers
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -376,7 +381,10 @@ class ArrowDataset(BaseDataset):
         #   "token_ids": [seq_len]
         # }
 
-        if not torch.equal(loaded_hs["token_ids"], self.data[index]["input_ids"]):
+        expected_ids = self.data[index]["input_ids"]
+        if not isinstance(expected_ids, torch.Tensor):
+            expected_ids = torch.tensor(expected_ids, dtype=torch.long)
+        if not torch.equal(loaded_hs["token_ids"], expected_ids):
             warnings.warn(
                 f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
                 f"match input ids {self.data[index]['input_ids']}",
@@ -384,15 +392,20 @@ class ArrowDataset(BaseDataset):
             )
             return None
 
+        hs = loaded_hs["hidden_states"]
+        if self.concat_all_hidden_layers:
+            return {
+                "multi_layer_hidden_states": hs.reshape(hs.shape[0], -1),
+                "input_ids": loaded_hs["token_ids"],
+                "verifier_last_hidden_states": hs[:, -1],
+                "loss_mask": self.data[index]["loss_mask"],
+            }
+
         return {
-            "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
-                1
-            ),  # [seq_len, 3 * hidden_size]
-            "input_ids": loaded_hs["token_ids"],  # [seq_len]
-            "verifier_last_hidden_states": loaded_hs["hidden_states"][
-                :, -1
-            ],  # [seq_len, hidden_size]
-            "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
+            "hidden_states": hs[:, :-1].flatten(1),
+            "input_ids": loaded_hs["token_ids"],
+            "verifier_last_hidden_states": hs[:, -1],
+            "loss_mask": self.data[index]["loss_mask"],
         }
 
 

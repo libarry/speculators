@@ -116,6 +116,46 @@ torchrun --nnodes=1 --nproc_per_node=8 scripts/train.py \
     --epochs 20
 ```
 
+### PARD-2 example
+
+PARD-2 trains a full draft causal LM with target-aligned feature injection and
+parallel COD collation. It uses offline verifier hidden states and does not use
+draft vocabulary reduction. COD resampling runs online in the collate step during
+training; you only need JSON/JSONL conversations for the raw data.
+
+**Full offline pipeline (minimal, 1 sample, Qwen3-8B verifier):**
+
+```bash
+bash examples/train/pard2_qwen3_8b_minimal_1sample_offline.sh
+```
+
+That script runs all six stages with comments: data prep → vLLM launch → hidden
+states generation → stop vLLM → train → export. Sample data lives at
+`examples/data/pard2_minimal_1sample.jsonl`.
+
+**Training-only step** (after hidden states are already on disk):
+
+```bash
+torchrun --nproc_per_node=8 scripts/train.py \
+    --speculator-type pard2 \
+    --draft-name-or-path Qwen/Qwen3-0.6B \
+    --verifier-name-or-path Qwen/Qwen3-8B \
+    --target-layer-ids -1 -8 -16 -24 \
+    --para-num 16 \
+    --down-sample-ratio 0.7 \
+    --down-sample-ratio-min 0.1 \
+    --data-path ./output \
+    --hidden-states-path ./output/hidden_states \
+    --total-seq-len 512 \
+    --epochs 4
+```
+
+Export a trained checkpoint for PARD/vLLM inference layout:
+
+```bash
+python scripts/export_pard2_checkpoint.py --checkpoint-dir ./output/checkpoints/0
+```
+
 ## How It Works
 
 **The flow during training:**

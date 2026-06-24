@@ -4,6 +4,7 @@ import logging
 import random
 import warnings
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,7 @@ import torch
 import transformers
 from packaging import version
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from transformers import LlamaConfig, PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -23,6 +25,10 @@ from speculators.model import SpeculatorModel
 from speculators.models.eagle3.data import shift_batch
 from speculators.models.metrics import resolve_loss_fn
 from speculators.models.mtp.data import shift_batch_mtp
+from speculators.models.pard2.data import (
+    create_pard2_collate_fn,
+    preprocess_pard2_sample,
+)
 from speculators.train.data import (
     ArrowDataset,
     BaseDataset,
@@ -76,6 +82,7 @@ def setup_dataloader(
     num_target_layers: int = 3,
     prefetch_factor: int = 4,
     preprocess=None,
+    collate_fn=None,
 ) -> DataLoader:
     """Setup dataloader for training.
     Args:
@@ -103,7 +110,8 @@ def setup_dataloader(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         pin_memory=True,
-        collate_fn=create_collate_fn(
+        collate_fn=collate_fn
+        or create_collate_fn(
             args.total_seq_len,
             hidden_size,
             num_target_layers=num_target_layers,
@@ -111,6 +119,35 @@ def setup_dataloader(
             preprocess=preprocess,
         ),
         persistent_workers=True,
+    )
+
+
+def setup_pard2_dataloader(
+    dataset: BaseDataset,
+    world_size: int,
+    rank: int,
+    hidden_size: int,
+    num_target_layers: int,
+    collate_fn,
+    num_workers: int = 12,
+    prefetch_factor: int = 4,
+) -> DataLoader:
+    """Single-sample dataloader for PARD-2 (4D attention masks)."""
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=1,
+        sampler=sampler,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        persistent_workers=num_workers > 0,
     )
 
 
@@ -313,6 +350,22 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
         d2t, t2d, draft_vocab_size = None, None, verifier_config.vocab_size
         transformer_layer_config = verifier_config
         args.mask_token_id = None
+    elif args.speculator_type == "pard2":
+        if not args.draft_name_or_path:
+            raise ValueError("--draft-name-or-path is required for pard2 training")
+        verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path)
+        if hasattr(verifier_config, "text_config"):
+            verifier_config = verifier_config.text_config
+        d2t, t2d, draft_vocab_size = None, None, verifier_config.vocab_size
+        transformer_layer_config = verifier_config
+        if args.mask_token_ids is None:
+            mask_token_id = resolve_mask_token_id(
+                args.verifier_name_or_path,
+                verifier_config.vocab_size,
+                args.mask_token_id,
+                trust_remote_code=args.trust_remote_code,
+            )
+            args.mask_token_ids = [mask_token_id] * max(args.para_num - 1, 1)
     else:
         d2t, t2d, draft_vocab_size = parse_vocab_mappings(args)
 
@@ -367,13 +420,38 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
     if args.speculator_type == "mtp":
         args.num_speculative_steps = draft_model.config.num_speculative_steps
 
-    # Setup dataloaders
-    preprocess_fns = {
-        "eagle3": shift_batch,
-        "peagle": shift_batch,
-        "mtp": shift_batch_mtp,
-    }
-    preprocess = preprocess_fns.get(args.speculator_type)
+    pard2_collate_fn = None
+    if args.speculator_type == "pard2":
+        preprocess = partial(
+            preprocess_pard2_sample,
+            end_token_id=args.end_token_id,
+        )
+        lm_head = draft_model.verifier_lm_head
+        pard2_collate_fn = create_pard2_collate_fn(
+            max_len=args.total_seq_len,
+            hidden_size=transformer_layer_config.hidden_size,
+            num_target_layers=num_target_layers,
+            para_num=args.para_num,
+            unused_tokenids=args.mask_token_ids,
+            down_sample_ratio=args.down_sample_ratio,
+            down_sample_ratio_min=args.down_sample_ratio_min,
+            lm_head_weight=lm_head.weight.detach().cpu().float(),
+            lm_head_bias=(
+                lm_head.bias.detach().cpu().float()
+                if lm_head.bias is not None
+                else None
+            ),
+            dtype=hidden_states_dtype,
+            preprocess=preprocess,
+        )
+    else:
+        # Setup dataloaders
+        preprocess_fns = {
+            "eagle3": shift_batch,
+            "peagle": shift_batch,
+            "mtp": shift_batch_mtp,
+        }
+        preprocess = preprocess_fns.get(args.speculator_type)
 
     noise_transform = AddUniformNoise(std=args.noise_std)
     if args.legacy_data:
@@ -408,6 +486,7 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=args.request_timeout,
             max_retries=args.max_retries,
+            concat_all_hidden_layers=args.speculator_type == "pard2",
         )
         val_dataset = ArrowDataset(
             datapath=args.data_path,
@@ -421,28 +500,51 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=args.request_timeout,
             max_retries=args.max_retries,
+            concat_all_hidden_layers=args.speculator_type == "pard2",
         )
 
-    train_loader = setup_dataloader(
-        train_dataset,
-        world_size,
-        rank,
-        transformer_layer_config.hidden_size,
-        num_target_layers=num_target_layers,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        preprocess=preprocess,
-    )
-    val_loader = setup_dataloader(
-        val_dataset,
-        world_size,
-        rank,
-        transformer_layer_config.hidden_size,
-        num_target_layers=num_target_layers,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        preprocess=preprocess,
-    )
+    if args.speculator_type == "pard2":
+        train_loader = setup_pard2_dataloader(
+            train_dataset,
+            world_size,
+            rank,
+            transformer_layer_config.hidden_size,
+            num_target_layers=num_target_layers,
+            collate_fn=pard2_collate_fn,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+        val_loader = setup_pard2_dataloader(
+            val_dataset,
+            world_size,
+            rank,
+            transformer_layer_config.hidden_size,
+            num_target_layers=num_target_layers,
+            collate_fn=pard2_collate_fn,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+    else:
+        train_loader = setup_dataloader(
+            train_dataset,
+            world_size,
+            rank,
+            transformer_layer_config.hidden_size,
+            num_target_layers=num_target_layers,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            preprocess=preprocess,
+        )
+        val_loader = setup_dataloader(
+            val_dataset,
+            world_size,
+            rank,
+            transformer_layer_config.hidden_size,
+            num_target_layers=num_target_layers,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            preprocess=preprocess,
+        )
 
     # Get trainer kwargs from model class
     train_call_kwargs, val_call_kwargs = model_class.get_trainer_kwargs(**vars(args))
@@ -510,7 +612,7 @@ def parse_args():
         "--speculator-type",
         type=str,
         default="eagle3",
-        help="Type of speculator model to train (eagle3, dflash, peagle, mtp)",
+        help="Type of speculator model to train (eagle3, dflash, peagle, mtp, pard2)",
     )
     parser.add_argument(
         "--from-pretrained",
@@ -788,7 +890,69 @@ def parse_args():
         "--down-sample-ratio-min",
         type=float,
         default=0.2,
-        help="Minimum retention ratio for COD sampling in P-EAGLE (default: 0.2)",
+        help="Minimum retention ratio for COD sampling (default: 0.2)",
+    )
+    # PARD-2 specific parameters
+    parser.add_argument(
+        "--draft-name-or-path",
+        type=str,
+        default=None,
+        help="Draft base causal LM for PARD-2 training",
+    )
+    parser.add_argument(
+        "--para-num",
+        type=int,
+        default=16,
+        help="Number of parallel draft blocks for PARD-2 (default: 16)",
+    )
+    parser.add_argument(
+        "--feat-scale",
+        type=float,
+        default=0.02,
+        help="Target feature scale for PARD-2 (default: 0.02)",
+    )
+    parser.add_argument(
+        "--target-feat-mask",
+        type=float,
+        default=0.2,
+        help="Target feature dropout probability for PARD-2 (default: 0.2)",
+    )
+    parser.add_argument(
+        "--ce-alpha",
+        type=float,
+        default=0.1,
+        help="CE loss weight for PARD-2 (default: 0.1)",
+    )
+    parser.add_argument(
+        "--kd-alpha",
+        type=float,
+        default=1.0,
+        help="KD loss weight for PARD-2 (default: 1.0)",
+    )
+    parser.add_argument(
+        "--kd-temperature",
+        type=float,
+        default=1.0,
+        help="KD temperature for PARD-2 (default: 1.0)",
+    )
+    parser.add_argument(
+        "--proj-bias",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use bias in PARD-2 target_proj (default: False)",
+    )
+    parser.add_argument(
+        "--end-token-id",
+        type=int,
+        default=None,
+        help="Only train after the last occurrence of this token (PARD-2)",
+    )
+    parser.add_argument(
+        "--mask-token-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Placeholder token ids for PARD-2 parallel draft positions",
     )
     parser.add_argument(
         "--sliding-window",
