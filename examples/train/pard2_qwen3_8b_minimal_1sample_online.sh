@@ -27,18 +27,18 @@ cd "$REPO_ROOT"
 # ============ 配置 ============
 VERIFIER="/data/models/qwen/Qwen3-8B"              # 目标 verifier（训练监督模型）
 DRAFT="/home/libowen/Qwen3-0.6B/"                # PARD-2 draft 底座
-DATA_FILE="$SCRIPT_DIR/../../../data/magpie_qwen25_pro.jsonl"
+DATA_FILE="$SCRIPT_DIR/../../../data/metamath_qwen3_8b.jsonl"
 OUTPUT_DIR="./output/pard2_qwen3_8b_minimal_online"
 HIDDEN_STATES_DIR="/dev/shm/pard2_hs"      # vLLM 中转目录；cache 模式下持久缓存
 VLLM_PORT=8119
-MAX_SAMPLES=1000
+MAX_SAMPLES=100
 SEQ_LENGTH=2048
 EPOCHS=4
 LR=3e-5
 
 # vLLM 推理：可见设备数须等于 VLLM_TP * VLLM_DP（多副本并发处理 hidden states 请求）
-VLLM_GPUS="4,5,6,7"
-VLLM_TP=2
+VLLM_GPUS="0,1"
+VLLM_TP=1
 VLLM_DP=2
 # Ascend 上 ACL graph capture 额外占显存；OOM 时可开 eager 并降低 utilization
 VLLM_GPU_MEMORY_UTIL=0.90
@@ -47,7 +47,7 @@ VLLM_ENFORCE_EAGER=0          # 1=禁用 NPU graph；0=开 graph，配合下方 
 VLLM_COMPILATION_CONFIG='{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
 VLLM_MAX_MODEL_LEN="$SEQ_LENGTH"
 # 训练：与 vLLM 卡不重叠
-TRAIN_GPUS="0,1,2,3"
+TRAIN_GPUS="2,4,5,6"
 NUM_TRAIN_GPUS=4
 # DataLoader 预取：worker 在训练当前 batch 时提前向 vLLM 发下一批请求
 DATALOADER_NUM_WORKERS=2
@@ -82,8 +82,8 @@ MASK_TOKEN_ID=151670
 SCHEDULER_TYPE="cosine_with_min_lr"
 SCHEDULER_MIN_LR_RATE=0.1
 SCHEDULER_WARMUP_RATIO=0.03
-PER_DEVICE_TRAIN_BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=8
+PER_DEVICE_TRAIN_BATCH_SIZE=4
+GRADIENT_ACCUMULATION_STEPS=1
 # =======================================
 
 # 将 PARD 的负向层索引转为 vLLM eagle_aux_hidden_state_layer_ids（1-based）

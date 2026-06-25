@@ -173,8 +173,6 @@ def test_collate_multi_sample_batch_has_batch_dim():
         unused_tokenids=[99, 100, 101],
         down_sample_ratio=0.7,
         down_sample_ratio_min=0.1,
-        lm_head_weight=torch.randn(64, hidden_size),
-        lm_head_bias=None,
     )
     samples = []
     for seq_len in (20, 24):
@@ -204,8 +202,6 @@ def test_collate_pads_prev_prob_to_max_len():
         unused_tokenids=list(range(100, 115)),
         down_sample_ratio=0.7,
         down_sample_ratio_min=0.1,
-        lm_head_weight=torch.randn(64, hidden_size),
-        lm_head_bias=None,
     )
     seq_len = 26
     sample = {
@@ -218,4 +214,105 @@ def test_collate_pads_prev_prob_to_max_len():
     assert batch["input_ids"].shape[1] == max_len
     assert batch["labels"].shape[1] == max_len
     assert batch["prev_prob"].shape[1] == max_len
-    assert batch["attention_mask"].shape[-1] == max_len
+    assert batch["gold_input_ids"].shape[0] == 1
+    assert batch["warp_indices"].shape[0] == 1
+
+
+def test_deferred_prev_prob_matches_inline_compute():
+    torch.manual_seed(0)
+    hidden_size = 32
+    vocab = 64
+    seq_len = 26
+    para_num = 16
+    lm_weight = torch.randn(vocab, hidden_size)
+
+    input_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+    labels = input_ids.clone()
+    teacher_hidden = torch.randn(1, seq_len, hidden_size)
+    teacher_gold_prob = compute_teacher_gold_prob(
+        input_ids, teacher_hidden, lm_weight
+    )
+
+    inline = apply_parallel_warp(
+        input_ids=input_ids,
+        labels=labels,
+        target_feat=None,
+        teacher_hidden=teacher_hidden,
+        teacher_gold_prob=teacher_gold_prob,
+        para_num=para_num,
+        unused_tokenids=list(range(100, 115)),
+        down_sample_ratio=0.7,
+        down_sample_ratio_min=0.1,
+    )
+
+    deferred = _data_mod.build_pard2_prev_prob_batch(
+        inline["gold_input_ids"],
+        inline["gold_teacher_hidden"],
+        inline["gold_labels"],
+        torch.tensor([seq_len], dtype=torch.long),
+        inline["warp_indices"].unsqueeze(0),
+        torch.tensor([inline["warp_indices"].numel()], dtype=torch.long),
+        lm_weight,
+        None,
+        para_num,
+        inline["prev_prob"].shape[1],
+        device=torch.device("cpu"),
+    )
+
+    assert torch.allclose(
+        deferred[:, : inline["prev_prob"].shape[1]],
+        inline["prev_prob"],
+        atol=1e-5,
+    )
+
+
+def test_deferred_prev_prob_truncates_to_max_len():
+    """Collate truncates warped seq to max_len; device prev_prob must match."""
+    torch.manual_seed(0)
+    hidden_size = 32
+    vocab = 64
+    seq_len = 180
+    max_len = 128
+    para_num = 16
+    lm_weight = torch.randn(vocab, hidden_size)
+
+    input_ids = (torch.arange(seq_len, dtype=torch.long) % vocab).unsqueeze(0)
+    labels = input_ids.clone()
+    teacher_hidden = torch.randn(1, seq_len, hidden_size)
+    teacher_gold_prob = compute_teacher_gold_prob(
+        input_ids, teacher_hidden, lm_weight
+    )
+
+    inline = apply_parallel_warp(
+        input_ids=input_ids,
+        labels=labels,
+        target_feat=None,
+        teacher_hidden=teacher_hidden,
+        teacher_gold_prob=teacher_gold_prob,
+        para_num=para_num,
+        unused_tokenids=list(range(100, 115)),
+        down_sample_ratio=0.7,
+        down_sample_ratio_min=0.1,
+    )
+    assert inline["prev_prob"].shape[1] > max_len
+
+    deferred = _data_mod.build_pard2_prev_prob_batch(
+        inline["gold_input_ids"],
+        inline["gold_teacher_hidden"],
+        inline["gold_labels"],
+        torch.tensor([seq_len], dtype=torch.long),
+        inline["warp_indices"].unsqueeze(0),
+        torch.tensor([inline["warp_indices"].numel()], dtype=torch.long),
+        lm_weight,
+        None,
+        para_num,
+        max_len,
+        device=torch.device("cpu"),
+    )
+
+    assert deferred.shape == (1, max_len)
+    assert torch.allclose(
+        deferred,
+        inline["prev_prob"][:, :max_len],
+        atol=1e-5,
+    )

@@ -133,8 +133,6 @@ def test_pard2_smoke_train(monkeypatch):
             unused_tokenids=[63, 63],
             down_sample_ratio=1.0,
             down_sample_ratio_min=0.0,
-            lm_head_weight=model.verifier_lm_head.weight.detach().cpu().float(),
-            lm_head_bias=None,
             preprocess=preprocess_pard2_sample,
         )
         loader = DataLoader(dataset, batch_size=1, collate_fn=collate)

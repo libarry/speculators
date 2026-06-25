@@ -420,17 +420,10 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
 
     pard2_collate_fn = None
     if args.speculator_type == "pard2":
-        lm_head = draft_model.verifier_lm_head
         pard2_collate_fn = create_pard2_collate_fn_from_draft_model(
             draft_model,
             max_len=args.total_seq_len,
             hidden_size=transformer_layer_config.hidden_size,
-            lm_head_weight=lm_head.weight.detach().cpu().float(),
-            lm_head_bias=(
-                lm_head.bias.detach().cpu().float()
-                if lm_head.bias is not None
-                else None
-            ),
             dtype=hidden_states_dtype,
         )
     else:

@@ -12,6 +12,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
 from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.model import SpeculatorModel
 from speculators.models.pard2.config import Pard2SpeculatorConfig
+from speculators.models.pard2.data import build_pard2_prev_prob_batch
 from speculators.models.utils import resolve_target_layer_ids
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.train.noise_transforms import AddUniformNoise
@@ -72,7 +73,9 @@ def weighted_kd_loss_chunked(
 def load_verifier_lm_head(path: str) -> nn.Linear:
     weights = load_model_layers(["lm_head.weight"], path)
     weight = weights["lm_head.weight"]
-    return nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+    lm_head = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+    lm_head.load_state_dict({"weight": weight.detach().clone()}, strict=False)
+    return lm_head
 
 
 @SpeculatorModel.register("pard2")
@@ -144,6 +147,12 @@ class Pard2DraftModel(SpeculatorModel):
         target_feat: torch.Tensor | None = None,
         teacher_hidden: torch.Tensor | None = None,
         prev_prob: torch.Tensor | None = None,
+        gold_input_ids: torch.Tensor | None = None,
+        gold_teacher_hidden: torch.Tensor | None = None,
+        gold_labels: torch.Tensor | None = None,
+        gold_seq_len: torch.Tensor | None = None,
+        warp_indices: torch.Tensor | None = None,
+        warp_indices_len: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[None, torch.Tensor, dict[str, torch.Tensor]]:
         del kwargs
@@ -152,6 +161,32 @@ class Pard2DraftModel(SpeculatorModel):
             raise ValueError("input_ids are required")
 
         inputs_embeds = self.draft_model.get_input_embeddings()(input_ids)
+        device = inputs_embeds.device
+
+        if (
+            self.prev_prob_loss
+            and teacher_hidden is not None
+            and gold_input_ids is not None
+            and gold_teacher_hidden is not None
+            and gold_labels is not None
+            and gold_seq_len is not None
+            and warp_indices is not None
+            and warp_indices_len is not None
+        ):
+            lm_head = self.verifier_lm_head
+            prev_prob = build_pard2_prev_prob_batch(
+                gold_input_ids,
+                gold_teacher_hidden,
+                gold_labels,
+                gold_seq_len,
+                warp_indices,
+                warp_indices_len,
+                lm_head.weight.to(device),
+                lm_head.bias.to(device) if lm_head.bias is not None else None,
+                self.config.para_num,
+                input_ids.shape[1],
+                device=device,
+            )
 
         if target_feat is not None:
             tf = target_feat.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)

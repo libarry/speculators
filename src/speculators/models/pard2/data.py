@@ -17,6 +17,7 @@ __all__ = [
     "BatchType",
     "apply_end_token_label_mask",
     "apply_parallel_warp",
+    "build_pard2_prev_prob_batch",
     "build_prev_prob",
     "build_shifted_target_feat",
     "compute_teacher_gold_prob",
@@ -85,7 +86,11 @@ def compute_teacher_gold_prob(
     lm_head_weight: torch.Tensor,
     lm_head_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Gold-token probability from verifier hidden states and lm_head."""
+    """Gold-token probability from verifier hidden states and lm_head.
+
+    For each position t>0, computes P_teacher(x_t | h_{t-1}) via the verifier
+    lm_head. Used to build CAT ``prev_prob`` weights for CE/KD loss.
+    """
     logits = F.linear(
         teacher_hidden.float(),
         lm_head_weight,
@@ -107,6 +112,106 @@ def compute_teacher_gold_prob(
     ).squeeze(-1)
     teacher_gold_prob[:, 1:] = gold_log_prob.exp()
     return teacher_gold_prob
+
+
+def _build_warp_block_labels(labels: torch.Tensor, para_num: int) -> torch.Tensor:
+    if labels.dim() == 1:
+        labels = labels.unsqueeze(0)
+    return torch.cat(
+        [
+            torch.cat(
+                [labels[:, :i] * 0 + IGNORE_LABEL, labels[:, i:]],
+                dim=1,
+            )
+            for i in range(para_num)
+        ],
+        dim=1,
+    )
+
+
+def _apply_cod_indices_to_prev_prob(
+    prev_prob: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    return torch.roll(
+        torch.roll(prev_prob, shifts=-1, dims=1)[:, indices],
+        shifts=1,
+        dims=1,
+    )
+
+
+def _pad_warp_indices_batch(
+    indices_list: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not indices_list:
+        return torch.empty(0, 0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+
+    lengths = torch.tensor([idx.numel() for idx in indices_list], dtype=torch.long)
+    max_len = int(lengths.max().item())
+    padded = torch.full((len(indices_list), max_len), -1, dtype=torch.long)
+    for row, indices in enumerate(indices_list):
+        padded[row, : indices.numel()] = indices.cpu()
+    return padded, lengths
+
+
+def build_pard2_prev_prob_batch(
+    gold_input_ids: torch.Tensor,
+    gold_teacher_hidden: torch.Tensor,
+    gold_labels: torch.Tensor,
+    gold_seq_len: torch.Tensor,
+    warp_indices: torch.Tensor,
+    warp_indices_len: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    lm_head_bias: torch.Tensor | None,
+    para_num: int,
+    target_len: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build warped ``prev_prob`` on ``device`` (deferred from CPU collate)."""
+    batch_size = gold_input_ids.shape[0]
+    prev_prob = torch.zeros(
+        batch_size,
+        target_len,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    if para_num == 1:
+        for batch_idx in range(batch_size):
+            seq_len = int(gold_seq_len[batch_idx].item())
+            if seq_len > 0:
+                copy_len = min(seq_len, target_len)
+                prev_prob[batch_idx, :copy_len] = 1.0
+        return prev_prob
+
+    for batch_idx in range(batch_size):
+        seq_len = int(gold_seq_len[batch_idx].item())
+        if seq_len <= 0:
+            continue
+
+        ids = gold_input_ids[batch_idx : batch_idx + 1, :seq_len].to(device)
+        hidden = gold_teacher_hidden[batch_idx : batch_idx + 1, :seq_len].to(device)
+        labels = gold_labels[batch_idx : batch_idx + 1, :seq_len].to(device)
+
+        gold_prob = compute_teacher_gold_prob(
+            ids,
+            hidden,
+            lm_head_weight,
+            lm_head_bias,
+        )
+        prev = build_prev_prob(gold_prob, para_num)
+        warp_labels = _build_warp_block_labels(labels, para_num)
+        prev = prev.masked_fill(warp_labels == IGNORE_LABEL, 0.0)
+
+        idx_len = int(warp_indices_len[batch_idx].item())
+        indices = warp_indices[batch_idx, :idx_len].to(device)
+        prev = _apply_cod_indices_to_prev_prob(prev, indices)
+        # Match collate: slice_and_pad_to_length truncates warped seq to max_len.
+        copy_len = min(prev.shape[1], target_len)
+        prev_prob[batch_idx, :copy_len] = prev.squeeze(0)[:copy_len]
+
+    return prev_prob
 
 
 def build_shifted_target_feat(multi_layer_hidden: torch.Tensor) -> torch.Tensor:
@@ -246,46 +351,70 @@ def apply_parallel_warp(
             dim=1,
         )
 
-    if down_sample_ratio != 1 and para_num > 1:
-        index_mask = torch.zeros(para_num, single_length, dtype=torch.bool, device=input_ids.device)
-        index_mask[0, :] = True
-        prev_indices = torch.arange(single_length, device=input_ids.device)
-
-        for i in range(1, para_num):
-            num_ones = int(
-                single_length * max(down_sample_ratio**i, down_sample_ratio_min)
+    use_cod = down_sample_ratio != 1 and para_num > 1
+    if para_num > 1:
+        new_data["gold_input_ids"] = input_ids
+        new_data["gold_labels"] = labels
+        new_data["warp_single_length"] = torch.tensor(single_length, dtype=torch.long)
+        if teacher_hidden is not None:
+            new_data["gold_teacher_hidden"] = teacher_hidden
+        if use_cod:
+            index_mask = torch.zeros(
+                para_num, single_length, dtype=torch.bool, device=input_ids.device
             )
-            if num_ones <= 0:
-                break
+            index_mask[0, :] = True
+            prev_indices = torch.arange(single_length, device=input_ids.device)
 
-            num_ones = min(num_ones, len(prev_indices))
-            selected_indices = prev_indices[torch.randperm(len(prev_indices), device=input_ids.device)[:num_ones]]
-            index_mask[i, selected_indices] = True
-            prev_indices = (selected_indices + 1) % single_length
+            for i in range(1, para_num):
+                num_ones = int(
+                    single_length * max(down_sample_ratio**i, down_sample_ratio_min)
+                )
+                if num_ones <= 0:
+                    break
 
-        index_mask = index_mask.reshape(-1)
-        indices = index_mask.nonzero(as_tuple=True)[0]
+                num_ones = min(num_ones, len(prev_indices))
+                selected_indices = prev_indices[
+                    torch.randperm(len(prev_indices), device=input_ids.device)[:num_ones]
+                ]
+                index_mask[i, selected_indices] = True
+                prev_indices = (selected_indices + 1) % single_length
 
-        filtered: dict[str, torch.Tensor] = {
-            "input_ids": new_data["input_ids"][:, indices].contiguous(),
-            "position_ids": new_data["position_ids"][:, indices].contiguous(),
-            "labels": torch.roll(
-                torch.roll(new_data["labels"], shifts=-1, dims=1)[:, indices],
-                shifts=1,
-                dims=1,
-            ).contiguous(),
-            "prev_prob": torch.roll(
-                torch.roll(new_data["prev_prob"], shifts=-1, dims=1)[:, indices],
-                shifts=1,
-                dims=1,
-            ).contiguous(),
-            "attention_mask": new_data["attention_mask"][:, :, indices, :][:, :, :, indices].contiguous(),
-        }
-        if "target_feat" in new_data:
-            filtered["target_feat"] = new_data["target_feat"][:, indices].contiguous()
-        if "teacher_hidden" in new_data:
-            filtered["teacher_hidden"] = new_data["teacher_hidden"][:, indices].contiguous()
-        new_data = filtered
+            indices = index_mask.reshape(-1).nonzero(as_tuple=True)[0]
+        else:
+            indices = torch.arange(tgt_len, device=input_ids.device)
+
+        new_data["warp_indices"] = indices
+
+        if use_cod:
+            filtered: dict[str, torch.Tensor] = {
+                "input_ids": new_data["input_ids"][:, indices].contiguous(),
+                "position_ids": new_data["position_ids"][:, indices].contiguous(),
+                "labels": torch.roll(
+                    torch.roll(new_data["labels"], shifts=-1, dims=1)[:, indices],
+                    shifts=1,
+                    dims=1,
+                ).contiguous(),
+                "prev_prob": torch.roll(
+                    torch.roll(new_data["prev_prob"], shifts=-1, dims=1)[:, indices],
+                    shifts=1,
+                    dims=1,
+                ).contiguous(),
+                "attention_mask": new_data["attention_mask"][:, :, indices, :][
+                    :, :, :, indices
+                ].contiguous(),
+                "gold_input_ids": new_data["gold_input_ids"],
+                "gold_labels": new_data["gold_labels"],
+                "gold_teacher_hidden": new_data.get("gold_teacher_hidden"),
+                "warp_single_length": new_data["warp_single_length"],
+                "warp_indices": new_data["warp_indices"],
+            }
+            if "target_feat" in new_data:
+                filtered["target_feat"] = new_data["target_feat"][:, indices].contiguous()
+            if "teacher_hidden" in new_data:
+                filtered["teacher_hidden"] = new_data["teacher_hidden"][
+                    :, indices
+                ].contiguous()
+            new_data = filtered
 
     return new_data
 
@@ -357,8 +486,6 @@ def _warp_and_pad_sample(
     unused_tokenids: list[int],
     down_sample_ratio: float,
     down_sample_ratio_min: float,
-    lm_head_weight: torch.Tensor,
-    lm_head_bias: torch.Tensor | None,
 ) -> BatchType:
     """Apply parallel warp to one sample and pad tensors to max_len."""
     input_ids = sample["input_ids"].unsqueeze(0)
@@ -371,16 +498,9 @@ def _warp_and_pad_sample(
     teacher_hidden = sample.get("teacher_hidden")
     if teacher_hidden is not None:
         teacher_hidden = teacher_hidden.unsqueeze(0)
-        teacher_gold_prob = compute_teacher_gold_prob(
-            input_ids,
-            teacher_hidden,
-            lm_head_weight.to(teacher_hidden.device, dtype=torch.float32),
-            lm_head_bias.to(teacher_hidden.device, dtype=torch.float32)
-            if lm_head_bias is not None
-            else None,
-        )
-    else:
-        teacher_gold_prob = torch.ones_like(input_ids, dtype=torch.float32)
+
+    # prev_prob is built on device in Pard2DraftModel.forward (see build_pard2_prev_prob_batch).
+    teacher_gold_prob = torch.ones_like(input_ids, dtype=torch.float32)
 
     warped = apply_parallel_warp(
         input_ids=input_ids,
@@ -394,8 +514,28 @@ def _warp_and_pad_sample(
         down_sample_ratio_min=down_sample_ratio_min,
     )
 
+    gold_seq_len = torch.tensor([input_ids.shape[1]], dtype=torch.long)
+    if "gold_input_ids" in warped:
+        warped["gold_input_ids"] = slice_and_pad_to_length(
+            warped["gold_input_ids"].squeeze(0), max_len
+        ).unsqueeze(0)
+        warped["gold_labels"] = slice_and_pad_to_length(
+            warped["gold_labels"].squeeze(0), max_len
+        ).unsqueeze(0)
+        if "gold_teacher_hidden" in warped and warped["gold_teacher_hidden"] is not None:
+            warped["gold_teacher_hidden"] = slice_and_pad_to_length(
+                warped["gold_teacher_hidden"].squeeze(0), max_len
+            ).unsqueeze(0)
+        warped["gold_seq_len"] = gold_seq_len
+
+    skip_pad = {
+        "attention_mask",
+        "warp_single_length",
+        "warp_indices",
+        "gold_seq_len",
+    }
     for key, tensor in list(warped.items()):
-        if key == "attention_mask" or tensor is None:
+        if key in skip_pad or tensor is None:
             continue
         if tensor.dim() == 2:
             warped[key] = slice_and_pad_to_length(tensor.squeeze(0), max_len).unsqueeze(0)
@@ -415,7 +555,14 @@ def _warp_and_pad_sample(
 def _merge_warped_samples(warped_samples: list[BatchType]) -> BatchType:
     """Concatenate per-sample warped batches along the batch dimension."""
     merged: BatchType = {}
+    skip_merge = {
+        "warp_single_length",
+        "warp_indices",
+        "gold_seq_len",
+    }
     for key in warped_samples[0]:
+        if key in skip_merge:
+            continue
         values = [sample[key] for sample in warped_samples if sample.get(key) is not None]
         if not values:
             continue
@@ -423,6 +570,24 @@ def _merge_warped_samples(warped_samples: list[BatchType]) -> BatchType:
             merged[key] = torch.cat(values, dim=0)
         else:
             merged[key] = torch.cat(values, dim=0)
+
+    if "warp_indices" in warped_samples[0]:
+        indices_list = [sample["warp_indices"].reshape(-1) for sample in warped_samples]
+        merged["warp_indices"], merged["warp_indices_len"] = _pad_warp_indices_batch(
+            indices_list
+        )
+        merged["warp_single_length"] = torch.stack(
+            [sample["warp_single_length"].reshape(()) for sample in warped_samples],
+            dim=0,
+        )
+    if "gold_seq_len" in warped_samples[0]:
+        merged["gold_seq_len"] = torch.stack(
+            [
+                sample["gold_seq_len"].reshape(-1)[0]
+                for sample in warped_samples
+            ],
+            dim=0,
+        )
     return merged
 
 
@@ -431,8 +596,6 @@ def create_pard2_collate_fn_from_draft_model(
     *,
     max_len: int,
     hidden_size: int,
-    lm_head_weight: torch.Tensor,
-    lm_head_bias: torch.Tensor | None,
     dtype: torch.dtype = torch.bfloat16,
 ):
     """Build collate_fn from a trained/initialized Pard2DraftModel config."""
@@ -449,8 +612,6 @@ def create_pard2_collate_fn_from_draft_model(
         unused_tokenids=list(cfg.mask_token_ids),
         down_sample_ratio=cfg.down_sample_ratio,
         down_sample_ratio_min=cfg.down_sample_ratio_min,
-        lm_head_weight=lm_head_weight,
-        lm_head_bias=lm_head_bias,
         dtype=dtype,
         preprocess=preprocess,
     )
@@ -464,8 +625,6 @@ def create_pard2_collate_fn(
     unused_tokenids: list[int],
     down_sample_ratio: float,
     down_sample_ratio_min: float,
-    lm_head_weight: torch.Tensor,
-    lm_head_bias: torch.Tensor | None,
     dtype: torch.dtype = torch.bfloat16,
     preprocess: Callable[[BatchType], BatchType] | None = None,
 ):
@@ -487,8 +646,6 @@ def create_pard2_collate_fn(
                 unused_tokenids=unused_tokenids,
                 down_sample_ratio=down_sample_ratio,
                 down_sample_ratio_min=down_sample_ratio_min,
-                lm_head_weight=lm_head_weight,
-                lm_head_bias=lm_head_bias,
             )
             for sample in batch
         ]
