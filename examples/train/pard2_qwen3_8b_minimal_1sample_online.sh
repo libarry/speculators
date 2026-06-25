@@ -31,8 +31,9 @@ DATA_FILE="$SCRIPT_DIR/../../../data/metamath_qwen3_8b.jsonl"
 OUTPUT_DIR="./output/pard2_qwen3_8b_minimal_online"
 HIDDEN_STATES_DIR="/dev/shm/pard2_hs"      # vLLM 中转目录；cache 模式下持久缓存
 VLLM_PORT=8119
-MAX_SAMPLES=100
+MAX_SAMPLES=100000
 SEQ_LENGTH=2048
+VLLM_SEQ_LENGTH=16384
 EPOCHS=4
 LR=3e-5
 
@@ -45,7 +46,7 @@ VLLM_GPU_MEMORY_UTIL=0.90
 VLLM_ENFORCE_EAGER=0          # 1=禁用 NPU graph；0=开 graph，配合下方 6 个 capture size
 # 默认会 capture 51 张图；hidden states 单请求场景 6 个即可，显著降低 capture 显存
 VLLM_COMPILATION_CONFIG='{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
-VLLM_MAX_MODEL_LEN="$SEQ_LENGTH"
+VLLM_MAX_MODEL_LEN="$VLLM_SEQ_LENGTH"
 # 训练：与 vLLM 卡不重叠
 TRAIN_GPUS="2,4,5,6"
 NUM_TRAIN_GPUS=4
@@ -129,7 +130,7 @@ python scripts/prepare_data.py \
     --output "$OUTPUT_DIR" \
     --max-samples "$MAX_SAMPLES" \
     --seq-length "$SEQ_LENGTH" \
-    --num-preprocessing-workers 32 \
+    --num-preprocessing-workers 64 \
     --overwrite
 
 # ---------------------------------------------------------------------------
