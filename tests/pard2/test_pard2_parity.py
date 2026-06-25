@@ -161,6 +161,37 @@ def test_align_attention_mask_pads_after_cod_downsample():
     )
 
 
+def test_collate_multi_sample_batch_has_batch_dim():
+    torch.manual_seed(0)
+    max_len = 128
+    hidden_size = 32
+    collate = _data_mod.create_pard2_collate_fn(
+        max_len=max_len,
+        hidden_size=hidden_size,
+        num_target_layers=4,
+        para_num=4,
+        unused_tokenids=[99, 100, 101],
+        down_sample_ratio=0.7,
+        down_sample_ratio_min=0.1,
+        lm_head_weight=torch.randn(64, hidden_size),
+        lm_head_bias=None,
+    )
+    samples = []
+    for seq_len in (20, 24):
+        samples.append(
+            {
+                "input_ids": torch.arange(seq_len, dtype=torch.long),
+                "labels": torch.arange(seq_len, dtype=torch.long),
+                "teacher_hidden": torch.randn(seq_len, hidden_size),
+                "target_feat": torch.randn(seq_len, hidden_size * 4),
+            }
+        )
+    batch = collate(samples)
+    assert batch["input_ids"].shape[0] == 2
+    assert batch["input_ids"].shape[1] == max_len
+    assert batch["attention_mask"].shape[0] == 2
+
+
 def test_collate_pads_prev_prob_to_max_len():
     torch.manual_seed(0)
     max_len = 128

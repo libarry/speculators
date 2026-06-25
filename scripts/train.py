@@ -26,8 +26,7 @@ from speculators.models.eagle3.data import shift_batch
 from speculators.models.metrics import resolve_loss_fn
 from speculators.models.mtp.data import shift_batch_mtp
 from speculators.models.pard2.data import (
-    create_pard2_collate_fn,
-    preprocess_pard2_sample,
+    create_pard2_collate_fn_from_draft_model,
 )
 from speculators.train.data import (
     ArrowDataset,
@@ -131,8 +130,9 @@ def setup_pard2_dataloader(
     collate_fn,
     num_workers: int = 12,
     prefetch_factor: int = 4,
+    batch_size: int = 1,
 ) -> DataLoader:
-    """Single-sample dataloader for PARD-2 (4D attention masks)."""
+    """PARD-2 dataloader with optional multi-sample batches (4D attention masks)."""
     sampler = DistributedSampler(
         dataset,
         num_replicas=world_size,
@@ -141,7 +141,7 @@ def setup_pard2_dataloader(
     )
     return DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=batch_size,
         sampler=sampler,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
@@ -359,13 +359,11 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
         d2t, t2d, draft_vocab_size = None, None, verifier_config.vocab_size
         transformer_layer_config = verifier_config
         if args.mask_token_ids is None:
-            mask_token_id = resolve_mask_token_id(
-                args.verifier_name_or_path,
-                verifier_config.vocab_size,
-                args.mask_token_id,
-                trust_remote_code=args.trust_remote_code,
-            )
-            args.mask_token_ids = [mask_token_id] * max(args.para_num - 1, 1)
+            if args.mask_token_id is None:
+                raise ValueError(
+                    "PARD-2 training requires --mask-token-id (or --mask-token-ids)"
+                )
+            args.mask_token_ids = [args.mask_token_id] * max(args.para_num - 1, 1)
     else:
         d2t, t2d, draft_vocab_size = parse_vocab_mappings(args)
 
@@ -422,19 +420,11 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
 
     pard2_collate_fn = None
     if args.speculator_type == "pard2":
-        preprocess = partial(
-            preprocess_pard2_sample,
-            end_token_id=args.end_token_id,
-        )
         lm_head = draft_model.verifier_lm_head
-        pard2_collate_fn = create_pard2_collate_fn(
+        pard2_collate_fn = create_pard2_collate_fn_from_draft_model(
+            draft_model,
             max_len=args.total_seq_len,
             hidden_size=transformer_layer_config.hidden_size,
-            num_target_layers=num_target_layers,
-            para_num=args.para_num,
-            unused_tokenids=args.mask_token_ids,
-            down_sample_ratio=args.down_sample_ratio,
-            down_sample_ratio_min=args.down_sample_ratio_min,
             lm_head_weight=lm_head.weight.detach().cpu().float(),
             lm_head_bias=(
                 lm_head.bias.detach().cpu().float()
@@ -442,7 +432,6 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
                 else None
             ),
             dtype=hidden_states_dtype,
-            preprocess=preprocess,
         )
     else:
         # Setup dataloaders
@@ -508,6 +497,11 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
             concat_all_hidden_layers=args.speculator_type == "pard2",
         )
 
+    if args.gradient_accumulation_steps is None:
+        args.gradient_accumulation_steps = 1
+    if args.per_device_train_batch_size is None:
+        args.per_device_train_batch_size = 1
+
     if args.speculator_type == "pard2":
         train_loader = setup_pard2_dataloader(
             train_dataset,
@@ -518,6 +512,7 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
             collate_fn=pard2_collate_fn,
             num_workers=args.num_workers,
             prefetch_factor=args.prefetch_factor,
+            batch_size=args.per_device_train_batch_size,
         )
         val_loader = setup_pard2_dataloader(
             val_dataset,
@@ -528,6 +523,7 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
             collate_fn=pard2_collate_fn,
             num_workers=args.num_workers,
             prefetch_factor=args.prefetch_factor,
+            batch_size=args.per_device_train_batch_size,
         )
     else:
         train_loader = setup_dataloader(
@@ -573,8 +569,11 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
         muon_adjust_lr_fn=args.muon_adjust_lr_fn,
         scheduler_type=args.scheduler_type,
         scheduler_warmup_steps=args.scheduler_warmup_steps,
+        scheduler_warmup_ratio=args.scheduler_warmup_ratio,
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
+        scheduler_min_lr_rate=args.scheduler_min_lr_rate,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         checkpoint_freq=args.checkpoint_freq,
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
@@ -1014,10 +1013,39 @@ def parse_args():
     )
 
     # lr scheduler
-    parser.add_argument("--scheduler-type", type=str, default="linear")
+    parser.add_argument(
+        "--scheduler-type",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine", "cosine_with_min_lr", "none"],
+    )
     parser.add_argument("--scheduler-warmup-steps", type=int, default=None)
+    parser.add_argument(
+        "--scheduler-warmup-ratio",
+        type=float,
+        default=None,
+        help="Warmup as a fraction of total optimizer steps (overrides 1%% default)",
+    )
     parser.add_argument("--scheduler-total-steps", type=int, default=None)
     parser.add_argument("--scheduler-num-cosine-cycles", type=float, default=0.5)
+    parser.add_argument(
+        "--scheduler-min-lr-rate",
+        type=float,
+        default=None,
+        help="Minimum LR as a fraction of peak LR for cosine_with_min_lr scheduler",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="Number of micro-batches per optimizer step (default: 1)",
+    )
+    parser.add_argument(
+        "--per-device-train-batch-size",
+        type=int,
+        default=None,
+        help="Training batch size per device (PARD-2 only; default: 1)",
+    )
 
     # optimizer
     parser.add_argument(

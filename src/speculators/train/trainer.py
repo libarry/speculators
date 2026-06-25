@@ -1,4 +1,5 @@
 import logging
+import math
 import warnings
 from typing import Literal, NamedTuple
 
@@ -13,6 +14,7 @@ from tqdm import TqdmExperimentalWarning
 from tqdm.rich import tqdm
 from transformers import (
     get_cosine_schedule_with_warmup,
+    get_cosine_with_min_lr_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
 
@@ -50,10 +52,15 @@ class TrainerConfig(NamedTuple):
     muon_weight_decay: float = 0.1
     muon_ns_steps: int = 5
     muon_adjust_lr_fn: str = "match_rms_adamw"
-    scheduler_type: Literal["linear", "cosine", "none"] = "linear"
+    scheduler_type: Literal[
+        "linear", "cosine", "cosine_with_min_lr", "none"
+    ] = "linear"
     scheduler_warmup_steps: int | None = None
+    scheduler_warmup_ratio: float | None = None
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
+    scheduler_min_lr_rate: float | None = None
+    gradient_accumulation_steps: int = 1
     checkpoint_freq: float = 1
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
@@ -170,14 +177,20 @@ class Trainer:
             self.schedulers: list[torch.optim.lr_scheduler.LRScheduler] = []
             return
 
-        # Compute defaults if None
-        scheduler_warmup_steps = (
-            self.config.scheduler_warmup_steps
-            or (self.config.num_epochs * len(self.train_loader)) // 100
-        )
+        grad_accum = max(1, self.config.gradient_accumulation_steps)
+        optimizer_steps_per_epoch = math.ceil(len(self.train_loader) / grad_accum)
         scheduler_total_steps = self.config.scheduler_total_steps or (
-            self.config.num_epochs * len(self.train_loader)
+            self.config.num_epochs * optimizer_steps_per_epoch
         )
+
+        if self.config.scheduler_warmup_steps is not None:
+            scheduler_warmup_steps = self.config.scheduler_warmup_steps
+        elif self.config.scheduler_warmup_ratio is not None:
+            scheduler_warmup_steps = int(
+                scheduler_total_steps * self.config.scheduler_warmup_ratio
+            )
+        else:
+            scheduler_warmup_steps = scheduler_total_steps // 100
 
         def make_scheduler(opt: torch.optim.Optimizer):
             if self.config.scheduler_type == "linear":
@@ -186,6 +199,15 @@ class Trainer:
                     num_warmup_steps=scheduler_warmup_steps,
                     num_training_steps=scheduler_total_steps,
                     last_epoch=last_epoch,
+                )
+            if self.config.scheduler_type == "cosine_with_min_lr":
+                return get_cosine_with_min_lr_schedule_with_warmup(
+                    opt,
+                    num_warmup_steps=scheduler_warmup_steps,
+                    num_training_steps=scheduler_total_steps,
+                    num_cycles=self.config.scheduler_num_cosine_cycles,
+                    last_epoch=last_epoch,
+                    min_lr_rate=self.config.scheduler_min_lr_rate,
                 )
             return get_cosine_schedule_with_warmup(
                 opt,
@@ -227,6 +249,9 @@ class Trainer:
             if self.config.checkpoint_freq < 1
             else None
         )
+        grad_accum = max(1, self.config.gradient_accumulation_steps)
+        self._optimizers_zero_grad()
+
         for local_step, batch in enumerate(train_loader, 1):
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
@@ -239,8 +264,14 @@ class Trainer:
                 **gpu_batch, **self.config.train_call_kwargs
             )
 
-            self._optimizers_zero_grad()
-            loss.backward()
+            (loss / grad_accum).backward()
+
+            should_step = (
+                local_step % grad_accum == 0 or local_step == num_steps
+            )
+            if not should_step:
+                continue
+
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self._optimizers_step()
 
@@ -248,6 +279,7 @@ class Trainer:
                 type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
             }
             self._schedulers_step()
+            self._optimizers_zero_grad()
 
             if self.global_step % self.config.log_freq == 0:
                 if self.is_distributed:

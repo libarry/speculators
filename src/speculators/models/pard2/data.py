@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import torch
@@ -20,6 +21,7 @@ __all__ = [
     "build_shifted_target_feat",
     "compute_teacher_gold_prob",
     "create_pard2_collate_fn",
+    "create_pard2_collate_fn_from_draft_model",
     "preprocess_pard2_sample",
 ]
 
@@ -347,6 +349,113 @@ def preprocess_pard2_sample(
     }
 
 
+def _warp_and_pad_sample(
+    sample: BatchType,
+    *,
+    max_len: int,
+    para_num: int,
+    unused_tokenids: list[int],
+    down_sample_ratio: float,
+    down_sample_ratio_min: float,
+    lm_head_weight: torch.Tensor,
+    lm_head_bias: torch.Tensor | None,
+) -> BatchType:
+    """Apply parallel warp to one sample and pad tensors to max_len."""
+    input_ids = sample["input_ids"].unsqueeze(0)
+    labels = sample["labels"].unsqueeze(0)
+
+    target_feat = sample.get("target_feat")
+    if target_feat is not None:
+        target_feat = target_feat.unsqueeze(0)
+
+    teacher_hidden = sample.get("teacher_hidden")
+    if teacher_hidden is not None:
+        teacher_hidden = teacher_hidden.unsqueeze(0)
+        teacher_gold_prob = compute_teacher_gold_prob(
+            input_ids,
+            teacher_hidden,
+            lm_head_weight.to(teacher_hidden.device, dtype=torch.float32),
+            lm_head_bias.to(teacher_hidden.device, dtype=torch.float32)
+            if lm_head_bias is not None
+            else None,
+        )
+    else:
+        teacher_gold_prob = torch.ones_like(input_ids, dtype=torch.float32)
+
+    warped = apply_parallel_warp(
+        input_ids=input_ids,
+        labels=labels,
+        target_feat=target_feat,
+        teacher_hidden=teacher_hidden,
+        teacher_gold_prob=teacher_gold_prob,
+        para_num=para_num,
+        unused_tokenids=unused_tokenids,
+        down_sample_ratio=down_sample_ratio,
+        down_sample_ratio_min=down_sample_ratio_min,
+    )
+
+    for key, tensor in list(warped.items()):
+        if key == "attention_mask" or tensor is None:
+            continue
+        if tensor.dim() == 2:
+            warped[key] = slice_and_pad_to_length(tensor.squeeze(0), max_len).unsqueeze(0)
+        elif tensor.dim() == 3:
+            warped[key] = slice_and_pad_to_length(tensor.squeeze(0), max_len).unsqueeze(0)
+
+    seq_len = warped["input_ids"].shape[1]
+    if "attention_mask" in warped and warped["attention_mask"] is not None:
+        warped["attention_mask"] = align_attention_mask(
+            warped["attention_mask"], seq_len
+        )
+
+    warped["lengths"] = torch.tensor([seq_len], dtype=torch.long)
+    return warped
+
+
+def _merge_warped_samples(warped_samples: list[BatchType]) -> BatchType:
+    """Concatenate per-sample warped batches along the batch dimension."""
+    merged: BatchType = {}
+    for key in warped_samples[0]:
+        values = [sample[key] for sample in warped_samples if sample.get(key) is not None]
+        if not values:
+            continue
+        if key == "lengths":
+            merged[key] = torch.cat(values, dim=0)
+        else:
+            merged[key] = torch.cat(values, dim=0)
+    return merged
+
+
+def create_pard2_collate_fn_from_draft_model(
+    draft_model: Any,
+    *,
+    max_len: int,
+    hidden_size: int,
+    lm_head_weight: torch.Tensor,
+    lm_head_bias: torch.Tensor | None,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """Build collate_fn from a trained/initialized Pard2DraftModel config."""
+    cfg = draft_model.config
+    preprocess = partial(
+        preprocess_pard2_sample,
+        end_token_id=cfg.end_token_id,
+    )
+    return create_pard2_collate_fn(
+        max_len=max_len,
+        hidden_size=hidden_size,
+        num_target_layers=len(cfg.target_layer_ids),
+        para_num=cfg.para_num,
+        unused_tokenids=list(cfg.mask_token_ids),
+        down_sample_ratio=cfg.down_sample_ratio,
+        down_sample_ratio_min=cfg.down_sample_ratio_min,
+        lm_head_weight=lm_head_weight,
+        lm_head_bias=lm_head_bias,
+        dtype=dtype,
+        preprocess=preprocess,
+    )
+
+
 def create_pard2_collate_fn(
     max_len: int,
     hidden_size: int,
@@ -360,7 +469,7 @@ def create_pard2_collate_fn(
     dtype: torch.dtype = torch.bfloat16,
     preprocess: Callable[[BatchType], BatchType] | None = None,
 ):
-    """Collate exactly one sample per step and apply parallel warp."""
+    """Collate one or more samples per step and apply parallel warp."""
 
     def collate_fn(batch: list[BatchType | None]) -> BatchType:
         batch = [preprocess(b) if preprocess else b for b in batch if b is not None]
@@ -370,53 +479,19 @@ def create_pard2_collate_fn(
                 empty = preprocess(empty)
             batch = [empty]
 
-        sample = batch[0]
-        input_ids = sample["input_ids"].unsqueeze(0)
-        labels = sample["labels"].unsqueeze(0)
-
-        target_feat = sample.get("target_feat")
-        if target_feat is not None:
-            target_feat = target_feat.unsqueeze(0)
-
-        teacher_hidden = sample.get("teacher_hidden")
-        if teacher_hidden is not None:
-            teacher_hidden = teacher_hidden.unsqueeze(0)
-            teacher_gold_prob = compute_teacher_gold_prob(
-                input_ids,
-                teacher_hidden,
-                lm_head_weight.to(teacher_hidden.device, dtype=torch.float32),
-                lm_head_bias.to(teacher_hidden.device, dtype=torch.float32) if lm_head_bias is not None else None,
+        warped_samples = [
+            _warp_and_pad_sample(
+                sample,
+                max_len=max_len,
+                para_num=para_num,
+                unused_tokenids=unused_tokenids,
+                down_sample_ratio=down_sample_ratio,
+                down_sample_ratio_min=down_sample_ratio_min,
+                lm_head_weight=lm_head_weight,
+                lm_head_bias=lm_head_bias,
             )
-        else:
-            teacher_gold_prob = torch.ones_like(input_ids, dtype=torch.float32)
-
-        warped = apply_parallel_warp(
-            input_ids=input_ids,
-            labels=labels,
-            target_feat=target_feat,
-            teacher_hidden=teacher_hidden,
-            teacher_gold_prob=teacher_gold_prob,
-            para_num=para_num,
-            unused_tokenids=unused_tokenids,
-            down_sample_ratio=down_sample_ratio,
-            down_sample_ratio_min=down_sample_ratio_min,
-        )
-
-        for key, tensor in list(warped.items()):
-            if key == "attention_mask" or tensor is None:
-                continue
-            if tensor.dim() == 2:
-                warped[key] = slice_and_pad_to_length(tensor.squeeze(0), max_len).unsqueeze(0)
-            elif tensor.dim() == 3:
-                warped[key] = slice_and_pad_to_length(tensor.squeeze(0), max_len).unsqueeze(0)
-
-        seq_len = warped["input_ids"].shape[1]
-        if "attention_mask" in warped and warped["attention_mask"] is not None:
-            warped["attention_mask"] = align_attention_mask(
-                warped["attention_mask"], seq_len
-            )
-
-        warped["lengths"] = torch.tensor([seq_len], dtype=torch.long)
-        return warped
+            for sample in batch
+        ]
+        return _merge_warped_samples(warped_samples)
 
     return collate_fn

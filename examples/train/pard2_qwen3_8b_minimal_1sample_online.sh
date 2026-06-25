@@ -13,6 +13,10 @@
 #
 # 混合模式（首 epoch 在线生成并缓存，后续 epoch 读盘）：
 #   将 ON_GENERATE 改为 cache，多 epoch 时可在第 2 个 epoch 起停掉 vLLM 以省显存。
+###############避免通信超时##########
+export HCCL_CONNECT_TIMEOUT=1800
+export HCCL_EXEC_TIMEOUT=1800
+##################################
 
 set -euo pipefail
 
@@ -27,15 +31,15 @@ DATA_FILE="$SCRIPT_DIR/../../../data/magpie_qwen25_pro.jsonl"
 OUTPUT_DIR="./output/pard2_qwen3_8b_minimal_online"
 HIDDEN_STATES_DIR="/dev/shm/pard2_hs"      # vLLM 中转目录；cache 模式下持久缓存
 VLLM_PORT=8119
-MAX_SAMPLES=1000000
-SEQ_LENGTH=8192
-EPOCHS=2
+MAX_SAMPLES=1000
+SEQ_LENGTH=2048
+EPOCHS=4
 LR=3e-5
 
 # vLLM 推理：可见设备数须等于 VLLM_TP * VLLM_DP（多副本并发处理 hidden states 请求）
-VLLM_GPUS="6,7"
+VLLM_GPUS="4,5,6,7"
 VLLM_TP=2
-VLLM_DP=1
+VLLM_DP=2
 # Ascend 上 ACL graph capture 额外占显存；OOM 时可开 eager 并降低 utilization
 VLLM_GPU_MEMORY_UTIL=0.90
 VLLM_ENFORCE_EAGER=0          # 1=禁用 NPU graph；0=开 graph，配合下方 6 个 capture size
@@ -43,11 +47,11 @@ VLLM_ENFORCE_EAGER=0          # 1=禁用 NPU graph；0=开 graph，配合下方 
 VLLM_COMPILATION_CONFIG='{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
 VLLM_MAX_MODEL_LEN="$SEQ_LENGTH"
 # 训练：与 vLLM 卡不重叠
-TRAIN_GPUS="0,1,2,3,4,5"
-NUM_TRAIN_GPUS=6
+TRAIN_GPUS="0,1,2,3"
+NUM_TRAIN_GPUS=4
 # DataLoader 预取：worker 在训练当前 batch 时提前向 vLLM 发下一批请求
 DATALOADER_NUM_WORKERS=2
-DATALOADER_PREFETCH_FACTOR=8
+DATALOADER_PREFETCH_FACTOR=4
 DEVICE_ENV_PREFIX="ASCEND_RT_VISIBLE_DEVICES"      # NVIDIA 环境改为 CUDA_VISIBLE_DEVICES
 
 run_on_devices() {
@@ -62,7 +66,7 @@ run_on_devices() {
 ON_MISSING="generate"
 ON_GENERATE="delete"
 
-# PARD-2 超参（对齐 PARD 官方 example_pard2_qwen3.yaml）
+# PARD-2 超参（对齐 PARD 官方 example_pard2_qwen3.yaml — general / loss）
 PARD_TARGET_LAYER_IDS=(-1 -8 -16 -24)
 PARA_NUM=16
 DOWN_SAMPLE_RATIO=0.7
@@ -71,6 +75,15 @@ FEAT_SCALE=0.02
 TARGET_FEAT_MASK=0.1
 CE_ALPHA=0.1
 KD_ALPHA=1.0
+# collator（example_pard2_qwen3.yaml）
+END_TOKEN_ID=151644
+MASK_TOKEN_ID=151670
+# train（example_pard2_qwen3.yaml）
+SCHEDULER_TYPE="cosine_with_min_lr"
+SCHEDULER_MIN_LR_RATE=0.1
+SCHEDULER_WARMUP_RATIO=0.03
+PER_DEVICE_TRAIN_BATCH_SIZE=1
+GRADIENT_ACCUMULATION_STEPS=8
 # =======================================
 
 # 将 PARD 的负向层索引转为 vLLM eagle_aux_hidden_state_layer_ids（1-based）
@@ -154,6 +167,10 @@ echo "vLLM 已就绪。"
 # 阶段 3：PARD-2 在线训练
 # hidden states 由 vLLM 按需生成；COD 重采样仍在 collate 阶段完成
 # ---------------------------------------------------------------------------
+##############debug#################
+export ASCEND_LAUNCH_BLOCKING=1
+##################################
+
 echo "=== 阶段 3/4：PARD-2 在线训练 ==="
 run_on_devices "$TRAIN_GPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_GPUS" \
@@ -169,6 +186,8 @@ run_on_devices "$TRAIN_GPUS" torchrun \
     --target-feat-mask "$TARGET_FEAT_MASK" \
     --ce-alpha "$CE_ALPHA" \
     --kd-alpha "$KD_ALPHA" \
+    --end-token-id "$END_TOKEN_ID" \
+    --mask-token-id "$MASK_TOKEN_ID" \
     --data-path "$OUTPUT_DIR" \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
@@ -178,7 +197,11 @@ run_on_devices "$TRAIN_GPUS" torchrun \
     --total-seq-len "$SEQ_LENGTH" \
     --epochs "$EPOCHS" \
     --lr "$LR" \
-    --scheduler-type cosine \
+    --scheduler-type "$SCHEDULER_TYPE" \
+    --scheduler-min-lr-rate "$SCHEDULER_MIN_LR_RATE" \
+    --scheduler-warmup-ratio "$SCHEDULER_WARMUP_RATIO" \
+    --per-device-train-batch-size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
+    --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS" \
     --num-workers "$DATALOADER_NUM_WORKERS" \
     --prefetch-factor "$DATALOADER_PREFETCH_FACTOR"
 

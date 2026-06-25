@@ -29,7 +29,7 @@ SEQ_LENGTH=128
 EPOCHS=1
 LR=3e-5
 
-# PARD-2 超参（对齐 PARD 官方 example_pard2_qwen3.yaml）
+# PARD-2 超参（对齐 PARD 官方 example_pard2_qwen3.yaml — general / loss）
 PARD_TARGET_LAYER_IDS=(-1 -8 -16 -24)
 PARA_NUM=16
 DOWN_SAMPLE_RATIO=0.7
@@ -38,6 +38,16 @@ FEAT_SCALE=0.02
 TARGET_FEAT_MASK=0.1
 CE_ALPHA=0.1
 KD_ALPHA=1.0
+# collator（example_pard2_qwen3.yaml）
+END_TOKEN_ID=151644
+MASK_TOKEN_ID=151670
+# train（example_pard2_qwen3.yaml；下方 SEQ_LENGTH/EPOCHS 为 smoke 用，正式训练改为 1024/4）
+SCHEDULER_TYPE="cosine_with_min_lr"
+SCHEDULER_MIN_LR_RATE=0.1
+SCHEDULER_WARMUP_RATIO=0.03
+PER_DEVICE_TRAIN_BATCH_SIZE=4
+GRADIENT_ACCUMULATION_STEPS=2
+DATALOADER_NUM_WORKERS=4
 # =======================================
 
 # 将 PARD 的负向层索引转为 vLLM eagle_aux_hidden_state_layer_ids（1-based）
@@ -141,14 +151,20 @@ ASCEND_RT_VISIBLE_DEVICES="$GPUS" torchrun \
     --target-feat-mask "$TARGET_FEAT_MASK" \
     --ce-alpha "$CE_ALPHA" \
     --kd-alpha "$KD_ALPHA" \
+    --end-token-id "$END_TOKEN_ID" \
+    --mask-token-id "$MASK_TOKEN_ID" \
     --data-path "$OUTPUT_DIR" \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     --save-path "$OUTPUT_DIR/checkpoints" \
     --total-seq-len "$SEQ_LENGTH" \
     --epochs "$EPOCHS" \
     --lr "$LR" \
-    --scheduler-type cosine \
-    --num-workers 1 \
+    --scheduler-type "$SCHEDULER_TYPE" \
+    --scheduler-min-lr-rate "$SCHEDULER_MIN_LR_RATE" \
+    --scheduler-warmup-ratio "$SCHEDULER_WARMUP_RATIO" \
+    --per-device-train-batch-size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
+    --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS" \
+    --num-workers "$DATALOADER_NUM_WORKERS" \
     --on-missing raise
 
 # ---------------------------------------------------------------------------

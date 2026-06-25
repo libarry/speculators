@@ -274,8 +274,15 @@ class Pard2DraftModel(SpeculatorModel):
         )
         target_feat_dim = verifier_config.hidden_size * len(target_layer_ids)
 
-        mask_token_ids = kwargs.get("mask_token_ids") or []
         para_num = int(kwargs.get("para_num", 16))
+        mask_token_ids = kwargs.get("mask_token_ids")
+        if mask_token_ids is None:
+            mask_token_id = kwargs.get("mask_token_id")
+            if mask_token_id is None:
+                raise ValueError(
+                    "PARD-2 training requires --mask-token-id or --mask-token-ids"
+                )
+            mask_token_ids = [int(mask_token_id)] * max(para_num - 1, 1)
         if len(mask_token_ids) < para_num - 1:
             raise ValueError(
                 f"Need at least {para_num - 1} mask token ids, got {len(mask_token_ids)}"
