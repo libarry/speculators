@@ -52,7 +52,13 @@ def _make_synthetic_arrow_dataset(tmp_path: Path, num_samples: int = 4, seq_len:
         input_ids = torch.arange(10, 10 + seq_len, dtype=torch.long)
         loss_mask = torch.zeros(seq_len, dtype=torch.bool)
         loss_mask[seq_len // 2 :] = True
-        hs = torch.randn(seq_len, 4, 32, dtype=torch.bfloat16)
+        hs = torch.stack(
+            [
+                torch.full((seq_len, 32), layer, dtype=torch.bfloat16)
+                for layer in range(4)
+            ],
+            dim=1,
+        )
         save_file(
             {
                 "hidden_states": hs,
@@ -114,6 +120,13 @@ def test_pard2_smoke_train(monkeypatch):
             max_len=32,
             on_missing="raise",
             concat_all_hidden_layers=True,
+            verifier_hidden_state_index=0,
+        )
+        sample = dataset[0]
+        assert sample is not None
+        assert torch.equal(
+            sample["verifier_last_hidden_states"],
+            sample["multi_layer_hidden_states"].view(16, 4, 32)[:, 0],
         )
         model = Pard2DraftModel.from_training_args(
             verifier_config=tiny_cfg,

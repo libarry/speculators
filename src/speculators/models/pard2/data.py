@@ -20,6 +20,7 @@ __all__ = [
     "build_pard2_prev_prob_batch",
     "build_prev_prob",
     "build_shifted_target_feat",
+    "compute_pard2_warped_length",
     "compute_teacher_gold_prob",
     "create_pard2_collate_fn",
     "create_pard2_collate_fn_from_draft_model",
@@ -27,11 +28,44 @@ __all__ = [
 ]
 
 
-def slice_and_pad_to_length(tensor: torch.Tensor, length: int) -> torch.Tensor:
+def slice_and_pad_to_length(
+    tensor: torch.Tensor,
+    length: int,
+    value: float = 0,
+) -> torch.Tensor:
     sliced_tensor = tensor[:length]
     padding = [0, 0] * sliced_tensor.dim()
     padding[-1] = length - sliced_tensor.shape[0]
-    return F.pad(sliced_tensor, padding)
+    return F.pad(sliced_tensor, padding, value=value)
+
+
+def compute_pard2_warped_length(
+    source_len: int,
+    para_num: int,
+    down_sample_ratio: float,
+    down_sample_ratio_min: float,
+) -> int:
+    """Maximum sequence length after PARD-2 parallel warp and COD.
+
+    PARD applies ``max_seq_length`` before the parallel warp. The warped training
+    sequence is longer, so speculators must budget for the post-warp length
+    instead of truncating it back to the pre-warp token length.
+    """
+    if para_num <= 1:
+        return source_len
+    if down_sample_ratio == 1:
+        return source_len * para_num
+
+    total = source_len
+    prev_count = source_len
+    for i in range(1, para_num):
+        count = int(source_len * max(down_sample_ratio**i, down_sample_ratio_min))
+        if count <= 0:
+            break
+        count = min(count, prev_count)
+        total += count
+        prev_count = count
+    return total
 
 
 def align_attention_mask(attn: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -482,6 +516,7 @@ def _warp_and_pad_sample(
     sample: BatchType,
     *,
     max_len: int,
+    gold_max_len: int,
     para_num: int,
     unused_tokenids: list[int],
     down_sample_ratio: float,
@@ -517,14 +552,14 @@ def _warp_and_pad_sample(
     gold_seq_len = torch.tensor([input_ids.shape[1]], dtype=torch.long)
     if "gold_input_ids" in warped:
         warped["gold_input_ids"] = slice_and_pad_to_length(
-            warped["gold_input_ids"].squeeze(0), max_len
+            warped["gold_input_ids"].squeeze(0), gold_max_len
         ).unsqueeze(0)
         warped["gold_labels"] = slice_and_pad_to_length(
-            warped["gold_labels"].squeeze(0), max_len
+            warped["gold_labels"].squeeze(0), gold_max_len, value=IGNORE_LABEL
         ).unsqueeze(0)
         if "gold_teacher_hidden" in warped and warped["gold_teacher_hidden"] is not None:
             warped["gold_teacher_hidden"] = slice_and_pad_to_length(
-                warped["gold_teacher_hidden"].squeeze(0), max_len
+                warped["gold_teacher_hidden"].squeeze(0), gold_max_len
             ).unsqueeze(0)
         warped["gold_seq_len"] = gold_seq_len
 
@@ -532,15 +567,23 @@ def _warp_and_pad_sample(
         "attention_mask",
         "warp_single_length",
         "warp_indices",
+        "gold_input_ids",
+        "gold_labels",
+        "gold_teacher_hidden",
         "gold_seq_len",
     }
     for key, tensor in list(warped.items()):
         if key in skip_pad or tensor is None:
             continue
+        pad_value = IGNORE_LABEL if key == "labels" else 0
         if tensor.dim() == 2:
-            warped[key] = slice_and_pad_to_length(tensor.squeeze(0), max_len).unsqueeze(0)
+            warped[key] = slice_and_pad_to_length(
+                tensor.squeeze(0), max_len, value=pad_value
+            ).unsqueeze(0)
         elif tensor.dim() == 3:
-            warped[key] = slice_and_pad_to_length(tensor.squeeze(0), max_len).unsqueeze(0)
+            warped[key] = slice_and_pad_to_length(
+                tensor.squeeze(0), max_len, value=pad_value
+            ).unsqueeze(0)
 
     seq_len = warped["input_ids"].shape[1]
     if "attention_mask" in warped and warped["attention_mask"] is not None:
@@ -600,12 +643,19 @@ def create_pard2_collate_fn_from_draft_model(
 ):
     """Build collate_fn from a trained/initialized Pard2DraftModel config."""
     cfg = draft_model.config
+    warped_max_len = compute_pard2_warped_length(
+        max_len,
+        cfg.para_num,
+        cfg.down_sample_ratio,
+        cfg.down_sample_ratio_min,
+    )
     preprocess = partial(
         preprocess_pard2_sample,
         end_token_id=cfg.end_token_id,
     )
     return create_pard2_collate_fn(
-        max_len=max_len,
+        max_len=warped_max_len,
+        gold_max_len=max_len,
         hidden_size=hidden_size,
         num_target_layers=len(cfg.target_layer_ids),
         para_num=cfg.para_num,
@@ -627,8 +677,10 @@ def create_pard2_collate_fn(
     down_sample_ratio_min: float,
     dtype: torch.dtype = torch.bfloat16,
     preprocess: Callable[[BatchType], BatchType] | None = None,
+    gold_max_len: int | None = None,
 ):
     """Collate one or more samples per step and apply parallel warp."""
+    gold_max_len = max_len if gold_max_len is None else gold_max_len
 
     def collate_fn(batch: list[BatchType | None]) -> BatchType:
         batch = [preprocess(b) if preprocess else b for b in batch if b is not None]
@@ -642,6 +694,7 @@ def create_pard2_collate_fn(
             _warp_and_pad_sample(
                 sample,
                 max_len=max_len,
+                gold_max_len=gold_max_len,
                 para_num=para_num,
                 unused_tokenids=unused_tokenids,
                 down_sample_ratio=down_sample_ratio,

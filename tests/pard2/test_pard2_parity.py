@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,6 +27,7 @@ _spec.loader.exec_module(_data_mod)
 build_prev_prob = _data_mod.build_prev_prob
 apply_parallel_warp = _data_mod.apply_parallel_warp
 compute_teacher_gold_prob = _data_mod.compute_teacher_gold_prob
+compute_pard2_warped_length = _data_mod.compute_pard2_warped_length
 
 def _pard_reference_build_prev_prob(
     teacher_gold_prob: torch.Tensor, para_num: int
@@ -161,6 +163,11 @@ def test_align_attention_mask_pads_after_cod_downsample():
     )
 
 
+def test_compute_pard2_warped_length_matches_cod_retention_budget():
+    assert compute_pard2_warped_length(26, 16, 0.7, 0.1) == 95
+    assert compute_pard2_warped_length(128, 2, 1.0, 0.0) == 256
+
+
 def test_collate_multi_sample_batch_has_batch_dim():
     torch.manual_seed(0)
     max_len = 128
@@ -214,8 +221,42 @@ def test_collate_pads_prev_prob_to_max_len():
     assert batch["input_ids"].shape[1] == max_len
     assert batch["labels"].shape[1] == max_len
     assert batch["prev_prob"].shape[1] == max_len
+    assert (batch["labels"][:, 95:] == _data_mod.IGNORE_LABEL).all()
     assert batch["gold_input_ids"].shape[0] == 1
     assert batch["warp_indices"].shape[0] == 1
+
+
+def test_collate_from_draft_model_uses_post_warp_length_budget():
+    torch.manual_seed(0)
+    hidden_size = 32
+    seq_len = 26
+    draft_model = SimpleNamespace(
+        config=SimpleNamespace(
+            end_token_id=None,
+            target_layer_ids=[-1, -8, -16, -24],
+            para_num=16,
+            mask_token_ids=list(range(100, 115)),
+            down_sample_ratio=0.7,
+            down_sample_ratio_min=0.1,
+        )
+    )
+    collate = _data_mod.create_pard2_collate_fn_from_draft_model(
+        draft_model,
+        max_len=seq_len,
+        hidden_size=hidden_size,
+    )
+    batch = collate(
+        [
+            {
+                "input_ids": torch.arange(seq_len, dtype=torch.long),
+                "loss_mask": torch.ones(seq_len, dtype=torch.bool),
+                "multi_layer_hidden_states": torch.randn(seq_len, hidden_size * 4),
+                "verifier_last_hidden_states": torch.randn(seq_len, hidden_size),
+            }
+        ]
+    )
+    assert batch["input_ids"].shape[1] == 95
+    assert batch["gold_input_ids"].shape[1] == seq_len
 
 
 def test_deferred_prev_prob_matches_inline_compute():

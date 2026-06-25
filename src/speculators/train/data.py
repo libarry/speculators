@@ -242,6 +242,7 @@ class ArrowDataset(BaseDataset):
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         concat_all_hidden_layers: bool = False,
+        verifier_hidden_state_index: int = -1,
     ):
         """Initialize the ArrowDataset.
         Args:
@@ -282,6 +283,7 @@ class ArrowDataset(BaseDataset):
         self.request_timeout = request_timeout
         self.max_retries = max_retries
         self.concat_all_hidden_layers = concat_all_hidden_layers
+        self.verifier_hidden_state_index = verifier_hidden_state_index
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -394,10 +396,11 @@ class ArrowDataset(BaseDataset):
 
         hs = loaded_hs["hidden_states"]
         if self.concat_all_hidden_layers:
+            teacher_hidden = hs[:, self.verifier_hidden_state_index]
             return {
                 "multi_layer_hidden_states": hs.reshape(hs.shape[0], -1),
                 "input_ids": loaded_hs["token_ids"],
-                "verifier_last_hidden_states": hs[:, -1],
+                "verifier_last_hidden_states": teacher_hidden,
                 "loss_mask": self.data[index]["loss_mask"],
             }
 

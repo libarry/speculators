@@ -18,9 +18,14 @@ from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.train.noise_transforms import AddUniformNoise
 from speculators.utils.loading import load_model_layers
 
-__all__ = ["Pard2DraftModel", "load_verifier_lm_head", "weighted_kd_loss_chunked"]
+__all__ = [
+    "Pard2DraftModel",
+    "load_verifier_lm_head",
+    "weighted_ce_loss_chunked",
+    "weighted_kd_loss_chunked",
+]
 
-_KD_CHUNK_SIZE = 512
+_LOSS_CHUNK_SIZE = 32
 
 
 def weighted_kd_loss_chunked(
@@ -30,7 +35,7 @@ def weighted_kd_loss_chunked(
     temperature: float,
     token_weight: torch.Tensor | None = None,
     *,
-    chunk_size: int = _KD_CHUNK_SIZE,
+    chunk_size: int = _LOSS_CHUNK_SIZE,
 ) -> torch.Tensor:
     """Memory-efficient KD loss over long sequences.
 
@@ -45,7 +50,8 @@ def weighted_kd_loss_chunked(
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
         student_chunk = shift_student_logits[:, start:end].float()
-        teacher_logits = lm_head(shift_teacher_hidden[:, start:end].float())
+        teacher_chunk = shift_teacher_hidden[:, start:end].to(dtype=lm_head.weight.dtype)
+        teacher_logits = lm_head(teacher_chunk).float()
 
         teacher_log_prob = F.log_softmax(teacher_logits / temperature, dim=-1)
         student_log_prob = F.log_softmax(student_chunk / temperature, dim=-1)
@@ -66,6 +72,35 @@ def weighted_kd_loss_chunked(
         else:
             weighted_sum = weighted_sum + token_kd.sum()
             weight_sum = weight_sum + token_kd.numel()
+
+    return weighted_sum / weight_sum.clamp_min(1e-6)
+
+
+def weighted_ce_loss_chunked(
+    shift_student_logits: torch.Tensor,
+    shift_labels: torch.Tensor,
+    token_weight: torch.Tensor,
+    *,
+    chunk_size: int = _LOSS_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Memory-efficient weighted CE over long PARD-2 warped sequences."""
+    _, seq_len, vocab_size = shift_student_logits.shape
+    weighted_sum = shift_student_logits.new_zeros(())
+    weight_sum = shift_student_logits.new_zeros(())
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        student_chunk = shift_student_logits[:, start:end].float()
+        labels_chunk = shift_labels[:, start:end]
+        weight_chunk = token_weight[:, start:end].to(student_chunk.dtype)
+        ce_chunk = F.cross_entropy(
+            student_chunk.reshape(-1, vocab_size),
+            labels_chunk.reshape(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).view_as(labels_chunk)
+        weighted_sum = weighted_sum + (ce_chunk * weight_chunk).sum()
+        weight_sum = weight_sum + weight_chunk.sum()
 
     return weighted_sum / weight_sum.clamp_min(1e-6)
 
@@ -228,16 +263,11 @@ class Pard2DraftModel(SpeculatorModel):
             else:
                 token_weight = valid_mask
 
-            shift_student_logits = student_logits[..., :-1, :].contiguous().float()
-            vocab_size = shift_student_logits.size(-1)
-            ce_per_token = F.cross_entropy(
-                shift_student_logits.view(-1, vocab_size),
-                shift_labels.view(-1),
-                reduction="none",
-                ignore_index=-100,
-            ).view_as(shift_labels)
-            denom = token_weight.sum().clamp_min(1e-6)
-            ce_loss = (ce_per_token * token_weight).sum() / denom
+            ce_loss = weighted_ce_loss_chunked(
+                student_logits[..., :-1, :],
+                shift_labels,
+                token_weight,
+            )
 
         if teacher_hidden is not None:
             teacher_hidden_t = teacher_hidden.to(

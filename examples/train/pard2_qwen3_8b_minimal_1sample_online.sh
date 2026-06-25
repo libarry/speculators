@@ -48,7 +48,7 @@ VLLM_ENFORCE_EAGER=0          # 1=禁用 NPU graph；0=开 graph，配合下方 
 VLLM_COMPILATION_CONFIG='{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
 VLLM_MAX_MODEL_LEN="$VLLM_SEQ_LENGTH"
 # 训练：与 vLLM 卡不重叠
-TRAIN_GPUS="2,4,5,6"
+TRAIN_GPUS="2,3,4,6"
 NUM_TRAIN_GPUS=4
 # DataLoader 预取：worker 在训练当前 batch 时提前向 vLLM 发下一批请求
 DATALOADER_NUM_WORKERS=2
@@ -83,7 +83,7 @@ MASK_TOKEN_ID=151670
 SCHEDULER_TYPE="cosine_with_min_lr"
 SCHEDULER_MIN_LR_RATE=0.1
 SCHEDULER_WARMUP_RATIO=0.03
-PER_DEVICE_TRAIN_BATCH_SIZE=4
+PER_DEVICE_TRAIN_BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS=1
 # =======================================
 
@@ -123,53 +123,53 @@ mkdir -p "$HIDDEN_STATES_DIR"
 # ---------------------------------------------------------------------------
 # 阶段 1：数据预处理
 # ---------------------------------------------------------------------------
-echo "=== 阶段 1/4：数据预处理 ==="
-python scripts/prepare_data.py \
-    --model "$VERIFIER" \
-    --data "$DATA_FILE" \
-    --output "$OUTPUT_DIR" \
-    --max-samples "$MAX_SAMPLES" \
-    --seq-length "$SEQ_LENGTH" \
-    --num-preprocessing-workers 64 \
-    --overwrite
+# echo "=== 阶段 1/4：数据预处理 ==="
+# python scripts/prepare_data.py \
+#     --model "$VERIFIER" \
+#     --data "$DATA_FILE" \
+#     --output "$OUTPUT_DIR" \
+#     --max-samples "$MAX_SAMPLES" \
+#     --seq-length "$SEQ_LENGTH" \
+#     --num-preprocessing-workers 64 \
+#     --overwrite
 
 # ---------------------------------------------------------------------------
 # 阶段 2：启动 vLLM（hidden states 提取，训练期间保持运行）
 # ---------------------------------------------------------------------------
-echo "=== 阶段 2/4：启动 vLLM 服务 ==="
-run_on_devices "$VLLM_GPUS" python scripts/launch_vllm.py "$VERIFIER" \
-    --hidden-states-path "$HIDDEN_STATES_DIR" \
-    --target-layer-ids $VLLM_TARGET_LAYER_IDS \
-    --no-include-last-layer \
-    -- \
-    --port "$VLLM_PORT" \
-    --tensor-parallel-size "$VLLM_TP" \
-    --data-parallel-size "$VLLM_DP" \
-    --max-model-len "$VLLM_MAX_MODEL_LEN" \
-    --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTIL" \
-    --compilation-config "$VLLM_COMPILATION_CONFIG" \
-    $([ "$VLLM_ENFORCE_EAGER" = "1" ] && echo --enforce-eager) &
-VLLM_PID=$!
+# echo "=== 阶段 2/4：启动 vLLM 服务 ==="
+# run_on_devices "$VLLM_GPUS" python scripts/launch_vllm.py "$VERIFIER" \
+#     --hidden-states-path "$HIDDEN_STATES_DIR" \
+#     --target-layer-ids $VLLM_TARGET_LAYER_IDS \
+#     --no-include-last-layer \
+#     -- \
+#     --port "$VLLM_PORT" \
+#     --tensor-parallel-size "$VLLM_TP" \
+#     --data-parallel-size "$VLLM_DP" \
+#     --max-model-len "$VLLM_MAX_MODEL_LEN" \
+#     --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTIL" \
+#     --compilation-config "$VLLM_COMPILATION_CONFIG" \
+#     $([ "$VLLM_ENFORCE_EAGER" = "1" ] && echo --enforce-eager) &
+# VLLM_PID=$!
 
-cleanup() {
-    echo "停止 vLLM 服务..."
-    kill "$VLLM_PID" 2>/dev/null || true
-    wait "$VLLM_PID" 2>/dev/null || true
-}
-trap cleanup EXIT
+# cleanup() {
+#     echo "停止 vLLM 服务..."
+#     kill "$VLLM_PID" 2>/dev/null || true
+#     wait "$VLLM_PID" 2>/dev/null || true
+# }
+# trap cleanup EXIT
 
-echo "等待 vLLM 就绪..."
-until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
-    sleep 2
-done
-echo "vLLM 已就绪。"
+# echo "等待 vLLM 就绪..."
+# until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
+#     sleep 2
+# done
+# echo "vLLM 已就绪。"
 
 # ---------------------------------------------------------------------------
 # 阶段 3：PARD-2 在线训练
 # hidden states 由 vLLM 按需生成；COD 重采样仍在 collate 阶段完成
 # ---------------------------------------------------------------------------
 ##############debug#################
-export ASCEND_LAUNCH_BLOCKING=1
+# export ASCEND_LAUNCH_BLOCKING=1
 ##################################
 
 echo "=== 阶段 3/4：PARD-2 在线训练 ==="

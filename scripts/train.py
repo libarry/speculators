@@ -419,7 +419,12 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
         args.num_speculative_steps = draft_model.config.num_speculative_steps
 
     pard2_collate_fn = None
+    pard2_verifier_hidden_state_index = -1
     if args.speculator_type == "pard2":
+        pard2_verifier_hidden_state_index = _resolve_pard2_verifier_hidden_state_index(
+            draft_model.target_layer_ids,
+            transformer_layer_config.num_hidden_layers,
+        )
         pard2_collate_fn = create_pard2_collate_fn_from_draft_model(
             draft_model,
             max_len=args.total_seq_len,
@@ -474,6 +479,7 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
             request_timeout=args.request_timeout,
             max_retries=args.max_retries,
             concat_all_hidden_layers=args.speculator_type == "pard2",
+            verifier_hidden_state_index=pard2_verifier_hidden_state_index,
         )
         val_dataset = ArrowDataset(
             datapath=args.data_path,
@@ -488,6 +494,7 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
             request_timeout=args.request_timeout,
             max_retries=args.max_retries,
             concat_all_hidden_layers=args.speculator_type == "pard2",
+            verifier_hidden_state_index=pard2_verifier_hidden_state_index,
         )
 
     if args.gradient_accumulation_steps is None:
@@ -595,6 +602,17 @@ def _checkpoint_freq(value: str) -> float:
             "as epoch counts and must be whole numbers."
         )
     return fvalue
+
+
+def _resolve_pard2_verifier_hidden_state_index(
+    target_layer_ids: list[int],
+    num_hidden_layers: int,
+) -> int:
+    """Locate the final verifier hidden state in exported PARD-2 layers."""
+    for idx, layer_id in enumerate(target_layer_ids):
+        if layer_id == -1 or layer_id == num_hidden_layers:
+            return idx
+    return -1
 
 
 def parse_args():
