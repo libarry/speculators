@@ -27,21 +27,27 @@ DATA_FILE="$SCRIPT_DIR/../../../data/magpie_qwen25_pro.jsonl"
 OUTPUT_DIR="./output/pard2_qwen3_8b_minimal_online"
 HIDDEN_STATES_DIR="/dev/shm/pard2_hs"      # vLLM 中转目录；cache 模式下持久缓存
 VLLM_PORT=8119
-MAX_SAMPLES=1000
+MAX_SAMPLES=1000000
 SEQ_LENGTH=8192
 EPOCHS=2
 LR=3e-5
 
-# vLLM 推理：物理卡 5,6，TP=2（可见设备数须等于 VLLM_TP）
-VLLM_GPUS="4,5,6,7"
-VLLM_TP=4
+# vLLM 推理：可见设备数须等于 VLLM_TP * VLLM_DP（多副本并发处理 hidden states 请求）
+VLLM_GPUS="6,7"
+VLLM_TP=2
+VLLM_DP=1
 # Ascend 上 ACL graph capture 额外占显存；OOM 时可开 eager 并降低 utilization
 VLLM_GPU_MEMORY_UTIL=0.90
-VLLM_ENFORCE_EAGER=1          # 1=禁用 NPU graph，避免 capture 阶段 OOM
+VLLM_ENFORCE_EAGER=0          # 1=禁用 NPU graph；0=开 graph，配合下方 6 个 capture size
+# 默认会 capture 51 张图；hidden states 单请求场景 6 个即可，显著降低 capture 显存
+VLLM_COMPILATION_CONFIG='{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
 VLLM_MAX_MODEL_LEN="$SEQ_LENGTH"
 # 训练：与 vLLM 卡不重叠
-TRAIN_GPUS="0,1,2,3"
-NUM_TRAIN_GPUS=4
+TRAIN_GPUS="0,1,2,3,4,5"
+NUM_TRAIN_GPUS=6
+# DataLoader 预取：worker 在训练当前 batch 时提前向 vLLM 发下一批请求
+DATALOADER_NUM_WORKERS=2
+DATALOADER_PREFETCH_FACTOR=8
 DEVICE_ENV_PREFIX="ASCEND_RT_VISIBLE_DEVICES"      # NVIDIA 环境改为 CUDA_VISIBLE_DEVICES
 
 run_on_devices() {
@@ -86,8 +92,15 @@ PY
 echo "Verifier:     $VERIFIER"
 echo "Draft:        $DRAFT"
 echo "Output:       $OUTPUT_DIR"
-echo "vLLM GPUs:    $VLLM_GPUS (TP=$VLLM_TP)"
+_vllm_gpu_count="$(echo "$VLLM_GPUS" | tr ',' '\n' | wc -l)"
+if [[ "$_vllm_gpu_count" -ne $((VLLM_TP * VLLM_DP)) ]]; then
+    echo "错误: VLLM_GPUS 数量 ($_vllm_gpu_count) 须等于 VLLM_TP * VLLM_DP ($((VLLM_TP * VLLM_DP)))" >&2
+    exit 1
+fi
+echo "vLLM GPUs:    $VLLM_GPUS (TP=$VLLM_TP, DP=$VLLM_DP)"
+echo "vLLM graphs:  $VLLM_COMPILATION_CONFIG (enforce_eager=$VLLM_ENFORCE_EAGER)"
 echo "Train GPUs:   $TRAIN_GPUS (x$NUM_TRAIN_GPUS)"
+echo "DataLoader:   num_workers=$DATALOADER_NUM_WORKERS, prefetch_factor=$DATALOADER_PREFETCH_FACTOR"
 echo "Online mode:  on_missing=$ON_MISSING, on_generate=$ON_GENERATE"
 echo "vLLM layers:  $VLLM_TARGET_LAYER_IDS (1-based)"
 
@@ -103,7 +116,7 @@ python scripts/prepare_data.py \
     --output "$OUTPUT_DIR" \
     --max-samples "$MAX_SAMPLES" \
     --seq-length "$SEQ_LENGTH" \
-    --num-preprocessing-workers 1 \
+    --num-preprocessing-workers 32 \
     --overwrite
 
 # ---------------------------------------------------------------------------
@@ -117,8 +130,10 @@ run_on_devices "$VLLM_GPUS" python scripts/launch_vllm.py "$VERIFIER" \
     -- \
     --port "$VLLM_PORT" \
     --tensor-parallel-size "$VLLM_TP" \
+    --data-parallel-size "$VLLM_DP" \
     --max-model-len "$VLLM_MAX_MODEL_LEN" \
     --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTIL" \
+    --compilation-config "$VLLM_COMPILATION_CONFIG" \
     $([ "$VLLM_ENFORCE_EAGER" = "1" ] && echo --enforce-eager) &
 VLLM_PID=$!
 
@@ -164,7 +179,8 @@ run_on_devices "$TRAIN_GPUS" torchrun \
     --epochs "$EPOCHS" \
     --lr "$LR" \
     --scheduler-type cosine \
-    --num-workers 1
+    --num-workers "$DATALOADER_NUM_WORKERS" \
+    --prefetch-factor "$DATALOADER_PREFETCH_FACTOR"
 
 # ---------------------------------------------------------------------------
 # 阶段 4：导出为 PARD/vLLM 推理目录结构
