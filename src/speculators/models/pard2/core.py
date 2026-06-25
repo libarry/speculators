@@ -14,9 +14,59 @@ from speculators.model import SpeculatorModel
 from speculators.models.pard2.config import Pard2SpeculatorConfig
 from speculators.models.utils import resolve_target_layer_ids
 from speculators.proposals.greedy import GreedyTokenProposalConfig
+from speculators.train.noise_transforms import AddUniformNoise
 from speculators.utils.loading import load_model_layers
 
-__all__ = ["Pard2DraftModel", "load_verifier_lm_head"]
+__all__ = ["Pard2DraftModel", "load_verifier_lm_head", "weighted_kd_loss_chunked"]
+
+_KD_CHUNK_SIZE = 512
+
+
+def weighted_kd_loss_chunked(
+    shift_student_logits: torch.Tensor,
+    shift_teacher_hidden: torch.Tensor,
+    lm_head: nn.Linear,
+    temperature: float,
+    token_weight: torch.Tensor | None = None,
+    *,
+    chunk_size: int = _KD_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Memory-efficient KD loss over long sequences.
+
+    Processes the sequence in chunks and uses log_target=True so full vocab
+    probability tensors are never materialized for the whole sequence at once.
+    """
+    batch, seq_len, _ = shift_student_logits.shape
+    temp_scale = temperature**2
+    weighted_sum = shift_student_logits.new_zeros(())
+    weight_sum = shift_student_logits.new_zeros(())
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        student_chunk = shift_student_logits[:, start:end].float()
+        teacher_logits = lm_head(shift_teacher_hidden[:, start:end].float())
+
+        teacher_log_prob = F.log_softmax(teacher_logits / temperature, dim=-1)
+        student_log_prob = F.log_softmax(student_chunk / temperature, dim=-1)
+        token_kd = (
+            F.kl_div(
+                student_log_prob,
+                teacher_log_prob,
+                reduction="none",
+                log_target=True,
+            ).sum(dim=-1)
+            * temp_scale
+        )
+
+        if token_weight is not None:
+            chunk_weight = token_weight[:, start:end].to(token_kd.dtype)
+            weighted_sum = weighted_sum + (token_kd * chunk_weight).sum()
+            weight_sum = weight_sum + chunk_weight.sum()
+        else:
+            weighted_sum = weighted_sum + token_kd.sum()
+            weight_sum = weight_sum + token_kd.numel()
+
+    return weighted_sum / weight_sum.clamp_min(1e-6)
 
 
 def load_verifier_lm_head(path: str) -> nn.Linear:
@@ -159,28 +209,26 @@ class Pard2DraftModel(SpeculatorModel):
                 device=student_logits.device,
                 dtype=student_logits.dtype,
             )
-            teacher_logits = self.verifier_lm_head(teacher_hidden_t.float())
-            temperature = float(self.kd_temperature)
-            shift_teacher_logits = teacher_logits[..., :-1, :].contiguous().float()
-            shift_student_logits = student_logits[..., :-1, :].contiguous().float()
-            teacher_prob = F.softmax(shift_teacher_logits / temperature, dim=-1)
-            student_log_prob = F.log_softmax(shift_student_logits / temperature, dim=-1)
-            token_kd = (
-                F.kl_div(student_log_prob, teacher_prob, reduction="none").sum(dim=-1)
-                * (temperature**2)
-            )
+            shift_student_logits = student_logits[..., :-1, :]
+            shift_teacher_hidden = teacher_hidden_t[..., :-1, :]
 
             if labels is not None and token_weight is not None:
-                kd_weight = token_weight.to(token_kd.dtype)
-                kd_loss = (token_kd * kd_weight).sum() / kd_weight.sum().clamp_min(1e-6)
+                kd_weight = token_weight
             elif prev_prob is not None and self.prev_prob_loss:
                 kd_weight = prev_prob[..., 1:].to(
-                    device=token_kd.device,
-                    dtype=token_kd.dtype,
+                    device=student_logits.device,
+                    dtype=student_logits.dtype,
                 )
-                kd_loss = (token_kd * kd_weight).sum() / kd_weight.sum().clamp_min(1e-6)
             else:
-                kd_loss = token_kd.mean()
+                kd_weight = None
+
+            kd_loss = weighted_kd_loss_chunked(
+                shift_student_logits,
+                shift_teacher_hidden,
+                self.verifier_lm_head,
+                float(self.kd_temperature),
+                kd_weight,
+            )
 
         if ce_loss is not None and kd_loss is not None:
             final_loss = ce_loss * self.ce_alpha + kd_loss * self.kd_alpha
@@ -265,6 +313,12 @@ class Pard2DraftModel(SpeculatorModel):
             ),
         )
         return cls(config=config)
+
+    @staticmethod
+    def get_dataset_transform(noise_std: float):
+        if noise_std <= 0:
+            return None
+        return AddUniformNoise(std=noise_std, tensors=("multi_layer_hidden_states",))
 
     @staticmethod
     def get_trainer_kwargs(**kwargs: Any) -> tuple[dict, dict]:

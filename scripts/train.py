@@ -453,7 +453,12 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
         }
         preprocess = preprocess_fns.get(args.speculator_type)
 
-    noise_transform = AddUniformNoise(std=args.noise_std)
+    get_dataset_transform = getattr(model_class, "get_dataset_transform", None)
+    noise_transform = (
+        get_dataset_transform(args.noise_std)
+        if get_dataset_transform is not None
+        else AddUniformNoise(std=args.noise_std)
+    )
     if args.legacy_data:
         warnings.warn(
             "Using '--legacy-data' is deprecated and will be removed soon.",

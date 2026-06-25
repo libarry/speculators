@@ -23,18 +23,24 @@ cd "$REPO_ROOT"
 # ============ 配置 ============
 VERIFIER="/data/models/qwen/Qwen3-8B"              # 目标 verifier（训练监督模型）
 DRAFT="/home/libowen/Qwen3-0.6B/"                # PARD-2 draft 底座
-DATA_FILE="$SCRIPT_DIR/../data/pard2_minimal_1sample.jsonl"
+DATA_FILE="$SCRIPT_DIR/../../../data/magpie_qwen25_pro.jsonl"
 OUTPUT_DIR="./output/pard2_qwen3_8b_minimal_online"
-HIDDEN_STATES_DIR="$OUTPUT_DIR/hidden_states"      # vLLM 中转目录；cache 模式下持久缓存
+HIDDEN_STATES_DIR="/dev/shm/pard2_hs"      # vLLM 中转目录；cache 模式下持久缓存
 VLLM_PORT=8119
-MAX_SAMPLES=1
-SEQ_LENGTH=128
-EPOCHS=1
+MAX_SAMPLES=1000
+SEQ_LENGTH=8192
+EPOCHS=2
 LR=3e-5
 
-# 在线训练：推理用 0 号卡，训练用 1-4 号卡（FSDP x4）
-VLLM_GPUS="0"
-TRAIN_GPUS="1,2,3,4"
+# vLLM 推理：物理卡 5,6，TP=2（可见设备数须等于 VLLM_TP）
+VLLM_GPUS="4,5,6,7"
+VLLM_TP=4
+# Ascend 上 ACL graph capture 额外占显存；OOM 时可开 eager 并降低 utilization
+VLLM_GPU_MEMORY_UTIL=0.90
+VLLM_ENFORCE_EAGER=1          # 1=禁用 NPU graph，避免 capture 阶段 OOM
+VLLM_MAX_MODEL_LEN="$SEQ_LENGTH"
+# 训练：与 vLLM 卡不重叠
+TRAIN_GPUS="0,1,2,3"
 NUM_TRAIN_GPUS=4
 DEVICE_ENV_PREFIX="ASCEND_RT_VISIBLE_DEVICES"      # NVIDIA 环境改为 CUDA_VISIBLE_DEVICES
 
@@ -80,7 +86,7 @@ PY
 echo "Verifier:     $VERIFIER"
 echo "Draft:        $DRAFT"
 echo "Output:       $OUTPUT_DIR"
-echo "vLLM GPUs:    $VLLM_GPUS"
+echo "vLLM GPUs:    $VLLM_GPUS (TP=$VLLM_TP)"
 echo "Train GPUs:   $TRAIN_GPUS (x$NUM_TRAIN_GPUS)"
 echo "Online mode:  on_missing=$ON_MISSING, on_generate=$ON_GENERATE"
 echo "vLLM layers:  $VLLM_TARGET_LAYER_IDS (1-based)"
@@ -108,7 +114,12 @@ run_on_devices "$VLLM_GPUS" python scripts/launch_vllm.py "$VERIFIER" \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     --target-layer-ids $VLLM_TARGET_LAYER_IDS \
     --no-include-last-layer \
-    -- --port "$VLLM_PORT" --gpu-memory-utilization 0.90 &
+    -- \
+    --port "$VLLM_PORT" \
+    --tensor-parallel-size "$VLLM_TP" \
+    --max-model-len "$VLLM_MAX_MODEL_LEN" \
+    --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTIL" \
+    $([ "$VLLM_ENFORCE_EAGER" = "1" ] && echo --enforce-eager) &
 VLLM_PID=$!
 
 cleanup() {
