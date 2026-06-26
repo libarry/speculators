@@ -11,11 +11,15 @@ from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
 
 from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.model import SpeculatorModel
+from speculators.models.base_components import model_classes
 from speculators.models.pard2.config import Pard2SpeculatorConfig
-from speculators.models.pard2.data import build_pard2_prev_prob_batch
+from speculators.models.pard2.data import build_pard2_prev_prob_batch, compute_teacher_gold_prob
 from speculators.models.pard2.loss_ops import (
     DEFAULT_SEQ_CHUNK_SIZE,
     DEFAULT_VOCAB_CHUNK_SIZE,
+    apply_rms_norm,
+    gather_label_log_prob_chunked,
+    gather_log_prob_chunked,
     token_kd_sum_chunked,
 )
 from speculators.models.utils import resolve_target_layer_ids
@@ -32,38 +36,22 @@ __all__ = [
 ]
 
 
-def compute_step_acceptance_metrics(
-    prev_prob: torch.Tensor,
+def _shift_parallel_step_ids(
     labels: torch.Tensor,
     para_num: int,
-    warp_indices: torch.Tensor | None = None,
-    warp_indices_len: torch.Tensor | None = None,
-    warp_single_length: torch.Tensor | None = None,
-) -> dict[str, torch.Tensor]:
-    """Estimate per-step acceptance from warped CAT ``prev_prob`` weights.
-
-    The metric is reported as ``acc_{i}`` where ``i`` is the
-    PARD-2 parallel draft block index in ``[0, para_num)``.
-    """
+    warp_single_length: torch.Tensor,
+    warp_indices: torch.Tensor | None,
+    warp_indices_len: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Map each label position to its PARD-2 parallel block index in ``[0, para_num)``."""
     if para_num <= 0 or labels.shape[1] <= 1:
-        return {}
+        return None
 
-    device = prev_prob.device
-    shift_prev_prob = prev_prob[..., 1:].to(dtype=torch.float32)
-    shift_labels = labels[..., 1:]
-    valid_mask = shift_labels != -100
-
-    acceptance_sum = torch.zeros(para_num, device=device, dtype=torch.float32)
-    acceptance_total = torch.zeros(para_num, device=device, dtype=torch.float32)
+    device = labels.device
     batch_size, seq_len = labels.shape
+    step_ids = torch.zeros(batch_size, seq_len, device=device, dtype=torch.long)
 
     for batch_idx in range(batch_size):
-        sample_valid = valid_mask[batch_idx]
-        if not sample_valid.any():
-            continue
-
-        if warp_single_length is None:
-            continue
         sample_single_len = int(warp_single_length[batch_idx].item())
         if sample_single_len <= 0:
             continue
@@ -71,11 +59,11 @@ def compute_step_acceptance_metrics(
         total_warp_len = sample_single_len * para_num
         if total_warp_len <= 0:
             continue
+
         base_steps = (
             torch.arange(total_warp_len, device=device, dtype=torch.long)
             // sample_single_len
         )
-
         if warp_indices is not None and warp_indices_len is not None:
             sample_idx_len = int(warp_indices_len[batch_idx].item())
             sample_indices = warp_indices[batch_idx, :sample_idx_len].to(
@@ -91,16 +79,105 @@ def compute_step_acceptance_metrics(
         else:
             sample_steps = base_steps
 
-        step_ids = torch.zeros(seq_len, device=device, dtype=torch.long)
         copy_len = min(int(sample_steps.numel()), seq_len)
         if copy_len > 0:
-            step_ids[:copy_len] = sample_steps[:copy_len]
-        shift_step_ids = step_ids[1:]
+            step_ids[batch_idx, :copy_len] = sample_steps[:copy_len]
 
+    return step_ids[:, 1:]
+
+
+def compute_draft_acceptance_prob(
+    student_logits: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    lm_head_bias: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+    *,
+    vocab_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Per-position draft acceptance probability under target verification.
+
+    For draft token ``x`` at each position, returns
+    ``min(1, P_target(x) / P_draft(x))``, matching standard speculative-decoding
+    rejection-sampling acceptance.
+    """
+    shift_logits = student_logits[..., :-1, :]
+    shift_teacher = teacher_hidden[..., :-1, :]
+    draft_tokens = shift_logits.argmax(dim=-1)
+
+    log_p_draft = gather_log_prob_chunked(
+        shift_logits,
+        draft_tokens,
+        vocab_chunk_size=vocab_chunk_size,
+    )
+    teacher_hidden_normed = (
+        apply_rms_norm(shift_teacher, norm_weight, eps=norm_eps)
+        if norm_weight is not None
+        else shift_teacher
+    )
+    log_p_teacher = gather_label_log_prob_chunked(
+        teacher_hidden_normed,
+        draft_tokens,
+        lm_head_weight,
+        lm_head_bias,
+        vocab_chunk_size=vocab_chunk_size,
+    )
+    ratio = (log_p_teacher - log_p_draft).exp()
+    return torch.clamp(ratio, max=1.0)
+
+
+def compute_step_acceptance_metrics(
+    student_logits: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    labels: torch.Tensor,
+    para_num: int,
+    lm_head_weight: torch.Tensor,
+    lm_head_bias: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+    warp_indices: torch.Tensor | None = None,
+    warp_indices_len: torch.Tensor | None = None,
+    warp_single_length: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Per parallel-block mean draft acceptance probability ``acc_{i}``."""
+    if para_num <= 0 or labels.shape[1] <= 1 or warp_single_length is None:
+        return {}
+
+    shift_labels = labels[..., 1:]
+    valid_mask = shift_labels != -100
+    shift_step_ids = _shift_parallel_step_ids(
+        labels,
+        para_num,
+        warp_single_length,
+        warp_indices,
+        warp_indices_len,
+    )
+    if shift_step_ids is None:
+        return {}
+
+    device = student_logits.device
+    acceptance_prob = compute_draft_acceptance_prob(
+        student_logits,
+        teacher_hidden,
+        lm_head_weight,
+        lm_head_bias,
+        norm_weight,
+        norm_eps,
+    ).to(device=device, dtype=torch.float32)
+
+    acceptance_sum = torch.zeros(para_num, device=device, dtype=torch.float32)
+    acceptance_total = torch.zeros(para_num, device=device, dtype=torch.float32)
+    batch_size = labels.shape[0]
+
+    for batch_idx in range(batch_size):
+        sample_valid = valid_mask[batch_idx]
+        if not sample_valid.any():
+            continue
         for step_idx in range(para_num):
-            step_mask = (shift_step_ids == step_idx) & sample_valid
+            step_mask = (shift_step_ids[batch_idx] == step_idx) & sample_valid
             if step_mask.any():
-                acceptance_sum[step_idx] = acceptance_sum[step_idx] + shift_prev_prob[
+                acceptance_sum[step_idx] = acceptance_sum[step_idx] + acceptance_prob[
                     batch_idx
                 ][step_mask].sum()
                 acceptance_total[step_idx] = acceptance_total[step_idx] + step_mask.sum()
@@ -110,6 +187,86 @@ def compute_step_acceptance_metrics(
         metrics[f"acc_{step_idx}_sum"] = acceptance_sum[step_idx]
         metrics[f"acc_{step_idx}_total"] = acceptance_total[step_idx]
     return metrics
+
+
+def compute_teacher_supervision_diagnostics(
+    gold_input_ids: torch.Tensor,
+    gold_teacher_hidden: torch.Tensor,
+    gold_seq_len: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    lm_head_bias: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+    *,
+    device: torch.device,
+    gold_teacher_gold_prob: torch.Tensor | None = None,
+    uniform_prob: float = 1.0 / 151936,
+) -> dict[str, torch.Tensor]:
+    """Diagnostics for teacher gold-prob supervision (hidden health + prob scale)."""
+    del lm_head_bias
+    metrics: dict[str, torch.Tensor] = {
+        "diag_gold_hidden_abs_mean_sum": torch.tensor(0.0, device=device),
+        "diag_gold_hidden_abs_mean_total": torch.tensor(0.0, device=device),
+        "diag_gold_prob_mean_sum": torch.tensor(0.0, device=device),
+        "diag_gold_prob_mean_total": torch.tensor(0.0, device=device),
+        "diag_gold_prob_max_sum": torch.tensor(0.0, device=device),
+        "diag_gold_prob_max_total": torch.tensor(0.0, device=device),
+        "diag_gold_prob_uniform_frac_sum": torch.tensor(0.0, device=device),
+        "diag_gold_prob_uniform_frac_total": torch.tensor(0.0, device=device),
+    }
+
+    batch_size = gold_input_ids.shape[0]
+    uniform_threshold = uniform_prob * 2.0
+    for batch_idx in range(batch_size):
+        seq_len = int(gold_seq_len[batch_idx].item())
+        if seq_len <= 1:
+            continue
+
+        ids = gold_input_ids[batch_idx : batch_idx + 1, :seq_len].to(device)
+        hidden = gold_teacher_hidden[batch_idx : batch_idx + 1, :seq_len].to(device)
+        metrics["diag_gold_hidden_abs_mean_sum"] = (
+            metrics["diag_gold_hidden_abs_mean_sum"] + hidden.abs().mean()
+        )
+        metrics["diag_gold_hidden_abs_mean_total"] = (
+            metrics["diag_gold_hidden_abs_mean_total"] + 1.0
+        )
+
+        gold_prob = (
+            gold_teacher_gold_prob[batch_idx : batch_idx + 1, :seq_len]
+            .to(device=device, dtype=torch.float32)
+            if gold_teacher_gold_prob is not None
+            else compute_teacher_gold_prob(
+                ids,
+                hidden,
+                lm_head_weight,
+                None,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
+        )
+        pos_probs = gold_prob[0, 1:seq_len]
+        metrics["diag_gold_prob_mean_sum"] = (
+            metrics["diag_gold_prob_mean_sum"] + pos_probs.mean()
+        )
+        metrics["diag_gold_prob_mean_total"] = (
+            metrics["diag_gold_prob_mean_total"] + 1.0
+        )
+        metrics["diag_gold_prob_max_sum"] = (
+            metrics["diag_gold_prob_max_sum"] + pos_probs.max()
+        )
+        metrics["diag_gold_prob_max_total"] = (
+            metrics["diag_gold_prob_max_total"] + 1.0
+        )
+        near_uniform = (pos_probs < uniform_threshold).float().mean()
+        metrics["diag_gold_prob_uniform_frac_sum"] = (
+            metrics["diag_gold_prob_uniform_frac_sum"] + near_uniform
+        )
+        metrics["diag_gold_prob_uniform_frac_total"] = (
+            metrics["diag_gold_prob_uniform_frac_total"] + 1.0
+        )
+
+    return metrics
+
 
 def weighted_kd_loss_chunked(
     shift_student_logits: torch.Tensor,
@@ -247,6 +404,29 @@ def load_verifier_lm_head(path: str) -> nn.Linear:
     return lm_head
 
 
+def load_verifier_final_norm(path: str) -> tuple[nn.Module, float]:
+    """Load verifier ``model.norm`` for logits-aligned gold-prob / KD."""
+    verifier_config = AutoConfig.from_pretrained(path)
+    if hasattr(verifier_config, "text_config"):
+        verifier_config = verifier_config.text_config
+    model_type = getattr(verifier_config, "model_type", None)
+    if model_type not in model_classes:
+        raise ValueError(
+            f"Unsupported verifier model_type={model_type!r} for PARD-2 final norm"
+        )
+    norm_class = model_classes[model_type].norm_class
+    norm_eps = float(getattr(verifier_config, "rms_norm_eps", 1e-6))
+    norm = norm_class(verifier_config.hidden_size, eps=norm_eps)
+    weights = load_model_layers(["model.norm.weight"], path)
+    norm.load_state_dict({"weight": weights["model.norm.weight"].detach().clone()})
+    for param in norm.parameters():
+        param.requires_grad_(False)
+    norm._num_hidden_layers = int(  # noqa: SLF001
+        getattr(verifier_config, "num_hidden_layers", 0)
+    )
+    return norm, norm_eps
+
+
 @SpeculatorModel.register("pard2")
 class Pard2DraftModel(SpeculatorModel):
     """PARD-2 target-aligned parallel draft model."""
@@ -255,10 +435,12 @@ class Pard2DraftModel(SpeculatorModel):
     _keys_to_ignore_on_save: ClassVar[list[str]] = [  # type: ignore[misc]
         "verifier_lm_head.weight",
         "verifier_lm_head.bias",
+        "verifier_norm.weight",
     ]
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
         "verifier_lm_head.weight",
         "verifier_lm_head.bias",
+        "verifier_norm.weight",
     ]
 
     def __init__(self, config: Pard2SpeculatorConfig):
@@ -274,11 +456,22 @@ class Pard2DraftModel(SpeculatorModel):
             hidden_size,
             bias=config.proj_bias,
         )
-        self.verifier_lm_head = load_verifier_lm_head(
-            config.speculators_config.verifier.name_or_path  # type: ignore[union-attr]
+        verifier_path = config.speculators_config.verifier.name_or_path  # type: ignore[union-attr]
+        self.verifier_lm_head = load_verifier_lm_head(verifier_path)
+        self.verifier_norm, self.verifier_norm_eps = load_verifier_final_norm(
+            verifier_path
         )
         for param in self.verifier_lm_head.parameters():
             param.requires_grad_(False)
+
+        # The verifier head/norm are populated with real weights via
+        # ``load_state_dict`` above, which does NOT mark them as HF-initialized.
+        # Without this flag, ``self.post_init()`` re-runs HF weight init over
+        # them and clobbers the loaded weights (lm_head -> normal(0, 0.02),
+        # norm -> ones). That silently turns the KD target, prev_prob weights,
+        # and acceptance metric into garbage (loss explodes, acc ~ 0).
+        self.verifier_lm_head._is_hf_initialized = True  # noqa: SLF001
+        self.verifier_norm._is_hf_initialized = True  # noqa: SLF001
 
         self.ce_alpha = config.ce_alpha
         self.kd_alpha = config.kd_alpha
@@ -286,6 +479,29 @@ class Pard2DraftModel(SpeculatorModel):
         self.target_feat_mask = config.target_feat_mask
         self.prev_prob_loss = config.prev_prob_loss
         self.feat_scale = config.feat_scale
+
+        # The PARD-2 draft was trained on the verifier's POST-final-norm last
+        # hidden state for its ``-1`` target-feature block (HF
+        # ``outputs.hidden_states[-1]`` is returned AFTER ``model.norm``). vLLM's
+        # aux-hidden-state extraction instead exports the PRE-norm residual last
+        # hidden (mid layers are pre-norm in both, so only the last block
+        # differs, by ~8x in scale). Locate that block so ``forward`` can apply
+        # the verifier final norm and match the official feature distribution.
+        # ``verifier_last_hidden_states`` (teacher hidden) is intentionally left
+        # PRE-norm because the loss/metric paths apply the norm themselves.
+        target_layer_ids = list(config.target_layer_ids)
+        num_target_layers = max(len(target_layer_ids), 1)
+        self._verifier_hidden_size = config.target_feat_dim // num_target_layers
+        verifier_num_layers = int(
+            getattr(self.verifier_norm, "_num_hidden_layers", 0)
+        )
+        self._target_feat_last_block: int | None = None
+        for idx, layer_id in enumerate(target_layer_ids):
+            if layer_id == -1 or (
+                verifier_num_layers and layer_id == verifier_num_layers
+            ):
+                self._target_feat_last_block = idx
+                break
 
         self.post_init()
 
@@ -318,6 +534,7 @@ class Pard2DraftModel(SpeculatorModel):
         prev_prob: torch.Tensor | None = None,
         gold_input_ids: torch.Tensor | None = None,
         gold_teacher_hidden: torch.Tensor | None = None,
+        gold_teacher_gold_prob: torch.Tensor | None = None,
         gold_labels: torch.Tensor | None = None,
         gold_seq_len: torch.Tensor | None = None,
         warp_single_length: torch.Tensor | None = None,
@@ -344,6 +561,7 @@ class Pard2DraftModel(SpeculatorModel):
             and warp_indices_len is not None
         ):
             lm_head = self.verifier_lm_head
+            norm_weight = self.verifier_norm.weight.to(device)
             prev_prob = build_pard2_prev_prob_batch(
                 gold_input_ids,
                 gold_teacher_hidden,
@@ -356,10 +574,39 @@ class Pard2DraftModel(SpeculatorModel):
                 self.config.para_num,
                 input_ids.shape[1],
                 device=device,
+                norm_weight=norm_weight,
+                norm_eps=self.verifier_norm_eps,
+                gold_teacher_gold_prob=gold_teacher_gold_prob,
             )
+            diag_metrics = compute_teacher_supervision_diagnostics(
+                gold_input_ids,
+                gold_teacher_hidden,
+                gold_seq_len,
+                lm_head.weight.to(device),
+                lm_head.bias.to(device) if lm_head.bias is not None else None,
+                norm_weight,
+                self.verifier_norm_eps,
+                device=device,
+                gold_teacher_gold_prob=gold_teacher_gold_prob,
+            )
+        else:
+            diag_metrics = {}
 
         if target_feat is not None:
             tf = target_feat.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            if self._target_feat_last_block is not None:
+                # Match the official feature distribution: the ``-1`` block is
+                # exported PRE-final-norm by vLLM but the draft expects the
+                # POST-final-norm last hidden. Normalize just that block.
+                h = self._verifier_hidden_size
+                start = self._target_feat_last_block * h
+                block = tf[..., start : start + h]
+                tf = tf.clone()
+                tf[..., start : start + h] = apply_rms_norm(
+                    block,
+                    self.verifier_norm.weight.to(block.device),
+                    eps=self.verifier_norm_eps,
+                )
             tf_proj = self.target_proj(tf) * self.feat_scale
             if tf_proj.shape[:2] != inputs_embeds.shape[:2]:
                 raise ValueError(
@@ -467,16 +714,33 @@ class Pard2DraftModel(SpeculatorModel):
         if kd_loss is not None:
             metrics["kd_loss_sum"] = kd_loss.detach().clone()
             metrics["kd_loss_total"] = torch.tensor(1.0, device=final_loss.device)
-        if prev_prob is not None and labels is not None and warp_single_length is not None:
+        if (
+            labels is not None
+            and teacher_hidden is not None
+            and warp_single_length is not None
+        ):
+            lm_head = self.verifier_lm_head
+            norm_weight = self.verifier_norm.weight.to(student_logits.device)
             step_acceptance_metrics = compute_step_acceptance_metrics(
-                prev_prob=prev_prob,
+                student_logits=student_logits,
+                teacher_hidden=teacher_hidden,
                 labels=labels,
                 para_num=int(self.config.para_num),
+                lm_head_weight=lm_head.weight.to(student_logits.device),
+                lm_head_bias=(
+                    lm_head.bias.to(student_logits.device)
+                    if lm_head.bias is not None
+                    else None
+                ),
+                norm_weight=norm_weight,
+                norm_eps=self.verifier_norm_eps,
                 warp_indices=warp_indices,
                 warp_indices_len=warp_indices_len,
                 warp_single_length=warp_single_length,
             )
             metrics.update(step_acceptance_metrics)
+        if diag_metrics:
+            metrics.update(diag_metrics)
 
         return None, final_loss, metrics
 

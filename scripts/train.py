@@ -103,11 +103,10 @@ def setup_dataloader(
         num_replicas=world_size,
         rank=rank,
     )
-    return DataLoader(
-        dataset,
+    loader_kwargs = dict(
+        dataset=dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
         pin_memory=True,
         collate_fn=collate_fn
         or create_collate_fn(
@@ -117,8 +116,11 @@ def setup_dataloader(
             dtype=dataset.hidden_states_dtype,
             preprocess=preprocess,
         ),
-        persistent_workers=True,
+        persistent_workers=num_workers > 0,
     )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(**loader_kwargs)
 
 
 def setup_pard2_dataloader(
@@ -139,16 +141,18 @@ def setup_pard2_dataloader(
         rank=rank,
         shuffle=True,
     )
-    return DataLoader(
-        dataset,
+    loader_kwargs = dict(
+        dataset=dataset,
         batch_size=batch_size,
         sampler=sampler,
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
         pin_memory=True,
         collate_fn=collate_fn,
         persistent_workers=num_workers > 0,
     )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(**loader_kwargs)
 
 
 def create_transformer_layer_config(  # noqa: C901
@@ -484,6 +488,16 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
             max_retries=args.max_retries,
             concat_all_hidden_layers=args.speculator_type == "pard2",
             verifier_hidden_state_index=pard2_verifier_hidden_state_index,
+            pard2_target_layer_ids=(
+                list(draft_model.target_layer_ids)
+                if args.speculator_type == "pard2"
+                else None
+            ),
+            num_hidden_layers=(
+                transformer_layer_config.num_hidden_layers
+                if args.speculator_type == "pard2"
+                else None
+            ),
         )
         val_dataset = ArrowDataset(
             datapath=args.data_path,
@@ -499,6 +513,16 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
             max_retries=args.max_retries,
             concat_all_hidden_layers=args.speculator_type == "pard2",
             verifier_hidden_state_index=pard2_verifier_hidden_state_index,
+            pard2_target_layer_ids=(
+                list(draft_model.target_layer_ids)
+                if args.speculator_type == "pard2"
+                else None
+            ),
+            num_hidden_layers=(
+                transformer_layer_config.num_hidden_layers
+                if args.speculator_type == "pard2"
+                else None
+            ),
         )
 
     if args.gradient_accumulation_steps is None:

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from speculators.models.pard2.loss_ops import (
     DEFAULT_VOCAB_CHUNK_SIZE,
+    apply_rms_norm,
     gather_label_log_prob_chunked,
 )
 
@@ -125,12 +126,15 @@ def compute_teacher_gold_prob(
     lm_head_weight: torch.Tensor,
     lm_head_bias: torch.Tensor | None = None,
     *,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
     vocab_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
 ) -> torch.Tensor:
     """Gold-token probability from verifier hidden states and lm_head.
 
     For each position t>0, computes P_teacher(x_t | h_{t-1}) via the verifier
-    lm_head. Used to build CAT ``prev_prob`` weights for CE/KD loss.
+    final RMSNorm + lm_head (equivalent to official PARD ``outputs.logits``).
+    Used to build CAT ``prev_prob`` weights for CE/KD loss.
     """
     teacher_gold_prob = torch.ones(
         input_ids.shape,
@@ -139,6 +143,9 @@ def compute_teacher_gold_prob(
     )
     if input_ids.shape[1] <= 1:
         return teacher_gold_prob
+
+    if norm_weight is not None:
+        teacher_hidden = apply_rms_norm(teacher_hidden, norm_weight, eps=norm_eps)
 
     shift_hidden = teacher_hidden[:, :-1, :]
     shift_labels = input_ids[:, 1:]
@@ -206,6 +213,9 @@ def build_pard2_prev_prob_batch(
     target_len: int,
     *,
     device: torch.device,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    gold_teacher_gold_prob: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build warped ``prev_prob`` on ``device`` (deferred from CPU collate)."""
     batch_size = gold_input_ids.shape[0]
@@ -233,12 +243,19 @@ def build_pard2_prev_prob_batch(
         hidden = gold_teacher_hidden[batch_idx : batch_idx + 1, :seq_len].to(device)
         labels = gold_labels[batch_idx : batch_idx + 1, :seq_len].to(device)
 
-        gold_prob = compute_teacher_gold_prob(
-            ids,
-            hidden,
-            lm_head_weight,
-            lm_head_bias,
-        )
+        if gold_teacher_gold_prob is not None:
+            gold_prob = gold_teacher_gold_prob[
+                batch_idx : batch_idx + 1, :seq_len
+            ].to(device=device, dtype=torch.float32)
+        else:
+            gold_prob = compute_teacher_gold_prob(
+                ids,
+                hidden,
+                lm_head_weight,
+                lm_head_bias,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
         prev = build_prev_prob(gold_prob, para_num)
         warp_labels = _build_warp_block_labels(labels, para_num)
         prev = prev.masked_fill(warp_labels == IGNORE_LABEL, 0.0)
@@ -282,7 +299,7 @@ def apply_parallel_warp(
     labels: torch.Tensor,
     target_feat: torch.Tensor | None,
     teacher_hidden: torch.Tensor | None,
-    teacher_gold_prob: torch.Tensor,
+    teacher_gold_prob: torch.Tensor | None,
     para_num: int,
     unused_tokenids: list[int],
     down_sample_ratio: float = 1.0,
@@ -343,7 +360,11 @@ def apply_parallel_warp(
         dim=1,
     )
 
-    prev_prob = build_prev_prob(teacher_gold_prob, para_num)
+    prev_prob = (
+        build_prev_prob(teacher_gold_prob, para_num)
+        if teacher_gold_prob is not None
+        else torch.ones(bs, tgt_len, dtype=torch.float32, device=input_ids.device)
+    )
     prev_prob = prev_prob.masked_fill(new_labels == IGNORE_LABEL, 0.0)
 
     new_data: dict[str, torch.Tensor] = {
@@ -397,6 +418,12 @@ def apply_parallel_warp(
         new_data["warp_single_length"] = torch.tensor(single_length, dtype=torch.long)
         if teacher_hidden is not None:
             new_data["gold_teacher_hidden"] = teacher_hidden
+        if (
+            teacher_gold_prob is not None
+            and teacher_gold_prob.dim() == 2
+            and teacher_gold_prob.shape == input_ids.shape
+        ):
+            new_data["gold_teacher_gold_prob"] = teacher_gold_prob
         if use_cod:
             index_mask = torch.zeros(
                 para_num, single_length, dtype=torch.bool, device=input_ids.device
@@ -444,6 +471,7 @@ def apply_parallel_warp(
                 "gold_input_ids": new_data["gold_input_ids"],
                 "gold_labels": new_data["gold_labels"],
                 "gold_teacher_hidden": new_data.get("gold_teacher_hidden"),
+                "gold_teacher_gold_prob": new_data.get("gold_teacher_gold_prob"),
                 "warp_single_length": new_data["warp_single_length"],
                 "warp_indices": new_data["warp_indices"],
             }
@@ -490,8 +518,14 @@ def preprocess_pard2_sample(
         target_feat = None
 
     teacher_hidden = batch.get("verifier_last_hidden_states")
+    if batch.get("verifier_kd_hidden") is not None:
+        teacher_hidden = batch["verifier_kd_hidden"]
     if teacher_hidden is not None and teacher_hidden.dim() == 2:
         teacher_hidden = teacher_hidden.squeeze(0)
+
+    teacher_gold_prob = batch.get("teacher_gold_prob")
+    if teacher_gold_prob is not None and teacher_gold_prob.dim() == 1:
+        teacher_gold_prob = teacher_gold_prob.unsqueeze(0)
 
     seq_len = input_ids.shape[0]
     lengths = batch.get("lengths", torch.tensor([seq_len], dtype=torch.long))
@@ -512,6 +546,7 @@ def preprocess_pard2_sample(
         "loss_mask": loss_mask,
         "target_feat": target_feat,
         "teacher_hidden": teacher_hidden,
+        "teacher_gold_prob": teacher_gold_prob,
         "lengths": lengths,
         "position_ids": position_ids,
     }
@@ -539,8 +574,9 @@ def _warp_and_pad_sample(
     if teacher_hidden is not None:
         teacher_hidden = teacher_hidden.unsqueeze(0)
 
-    # prev_prob is built on device in Pard2DraftModel.forward (see build_pard2_prev_prob_batch).
-    teacher_gold_prob = torch.ones_like(input_ids, dtype=torch.float32)
+    teacher_gold_prob = sample.get("teacher_gold_prob")
+    if teacher_gold_prob is not None and teacher_gold_prob.dim() == 1:
+        teacher_gold_prob = teacher_gold_prob.unsqueeze(0)
 
     warped = apply_parallel_warp(
         input_ids=input_ids,
@@ -566,6 +602,10 @@ def _warp_and_pad_sample(
             warped["gold_teacher_hidden"] = slice_and_pad_to_length(
                 warped["gold_teacher_hidden"].squeeze(0), gold_max_len
             ).unsqueeze(0)
+        if "gold_teacher_gold_prob" in warped and warped["gold_teacher_gold_prob"] is not None:
+            warped["gold_teacher_gold_prob"] = slice_and_pad_to_length(
+                warped["gold_teacher_gold_prob"].squeeze(0), gold_max_len, value=1.0
+            ).unsqueeze(0)
         warped["gold_seq_len"] = gold_seq_len
 
     skip_pad = {
@@ -575,6 +615,7 @@ def _warp_and_pad_sample(
         "gold_input_ids",
         "gold_labels",
         "gold_teacher_hidden",
+        "gold_teacher_gold_prob",
         "gold_seq_len",
     }
     for key, tensor in list(warped.items()):

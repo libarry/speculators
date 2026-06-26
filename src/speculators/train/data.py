@@ -17,6 +17,8 @@ from safetensors.torch import load_file
 from torch.utils.data import Dataset
 
 from speculators.data_generation.offline import check_hidden_states
+from speculators.data_generation.offline import check_hidden_states
+from speculators.models.pard2.vllm_hidden_states import reorder_vllm_hidden_states
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
@@ -243,6 +245,8 @@ class ArrowDataset(BaseDataset):
         max_retries: int = DEFAULT_MAX_RETRIES,
         concat_all_hidden_layers: bool = False,
         verifier_hidden_state_index: int = -1,
+        pard2_target_layer_ids: list[int] | None = None,
+        num_hidden_layers: int | None = None,
     ):
         """Initialize the ArrowDataset.
         Args:
@@ -284,6 +288,8 @@ class ArrowDataset(BaseDataset):
         self.max_retries = max_retries
         self.concat_all_hidden_layers = concat_all_hidden_layers
         self.verifier_hidden_state_index = verifier_hidden_state_index
+        self.pard2_target_layer_ids = pard2_target_layer_ids
+        self.num_hidden_layers = num_hidden_layers
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -395,14 +401,25 @@ class ArrowDataset(BaseDataset):
             return None
 
         hs = loaded_hs["hidden_states"]
+        if (
+            self.concat_all_hidden_layers
+            and self.pard2_target_layer_ids is not None
+            and self.num_hidden_layers is not None
+        ):
+            hs = reorder_vllm_hidden_states(
+                hs,
+                self.pard2_target_layer_ids,
+                self.num_hidden_layers,
+            )
         if self.concat_all_hidden_layers:
             teacher_hidden = hs[:, self.verifier_hidden_state_index]
-            return {
+            payload = {
                 "multi_layer_hidden_states": hs.reshape(hs.shape[0], -1),
                 "input_ids": loaded_hs["token_ids"],
                 "verifier_last_hidden_states": teacher_hidden,
                 "loss_mask": self.data[index]["loss_mask"],
             }
+            return payload
 
         return {
             "hidden_states": hs[:, :-1].flatten(1),

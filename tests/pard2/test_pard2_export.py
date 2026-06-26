@@ -61,3 +61,4 @@ def test_convert_checkpoint_for_infer(tmp_path: Path, monkeypatch):
     assert (Path(result["model_path"]) / "model.safetensors").exists()
     infer_cfg = json.loads((Path(result["model_path"]) / "config.json").read_text())
     assert infer_cfg.get("pard2") is True
+    assert infer_cfg.get("draft_name_or_path") is None

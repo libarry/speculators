@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -10,7 +12,47 @@ from transformers import AutoConfig
 
 from speculators.models.pard2.config import Pard2SpeculatorConfig
 
-__all__ = ["convert_checkpoint_for_infer"]
+__all__ = [
+    "convert_checkpoint_for_infer",
+    "prepare_pard2_infer_config",
+    "sanitize_pard2_infer_config",
+]
+
+# Training-only / legacy keys stripped by official PARD export.
+_TRAINING_ONLY_CONFIG_KEYS = (
+    "ce_alpha",
+    "kd_alpha",
+    "kd_temperature",
+    "prev_prob_loss",
+    "target_feat_mask",
+    "feat_scale",
+    "ml",
+    "pard_scale",
+    "pard_target_dim",
+    "pard2_ml",
+    "proj_bias",
+    "target_layers",
+    "target_layer_ids",
+    "target_feat_dim",
+    "draft_name_or_path",
+)
+
+
+def sanitize_pard2_infer_config(cfg) -> None:
+    """Strip training-only keys; keep the draft model's Transformers config as-is."""
+    for key in _TRAINING_ONLY_CONFIG_KEYS:
+        if hasattr(cfg, key):
+            try:
+                delattr(cfg, key)
+            except AttributeError:
+                pass
+        cfg.__dict__.pop(key, None)
+
+    # Prefer a single dtype field: keep whichever the draft config already uses.
+    dtype = getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None)
+    if dtype is not None:
+        cfg.dtype = dtype
+        cfg.torch_dtype = dtype
 
 
 def prepare_pard2_infer_config(
@@ -34,7 +76,9 @@ def prepare_pard2_infer_config(
     cfg.pard2_proj_bias = bool(proj_bias)
     cfg.pard2_target_dim = int(target_dim)
     cfg.pard2_target_layers = [int(layer) for layer in target_layers]
-    cfg.pard_token = pard_token
+    if pard_token != -1:
+        cfg.pard_token = pard_token
+    sanitize_pard2_infer_config(cfg)
     return cfg
 
 
@@ -76,6 +120,13 @@ def convert_checkpoint_for_infer(checkpoint_dir: str) -> dict:
         pard_token=pard2_cfg.pard_token,
     )
     cfg.save_pretrained(model_path)
+
+    # Post-save scrub: drop training-only keys accidentally serialized.
+    infer_cfg_path = Path(model_path) / "config.json"
+    infer_cfg = json.loads(infer_cfg_path.read_text(encoding="utf-8"))
+    for key in _TRAINING_ONLY_CONFIG_KEYS:
+        infer_cfg.pop(key, None)
+    infer_cfg_path.write_text(json.dumps(infer_cfg, indent=2), encoding="utf-8")
 
     return {
         "model_path": model_path,

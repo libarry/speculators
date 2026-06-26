@@ -111,6 +111,10 @@ def test_pard2_smoke_train(monkeypatch):
         "speculators.models.pard2.core.load_verifier_lm_head",
         lambda path: torch.nn.Linear(32, 64, bias=False),
     )
+    monkeypatch.setattr(
+        "speculators.models.pard2.core.load_verifier_final_norm",
+        lambda path: (torch.nn.LayerNorm(32, elementwise_affine=True), 1e-6),
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)

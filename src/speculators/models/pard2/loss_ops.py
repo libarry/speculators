@@ -11,10 +11,25 @@ DEFAULT_VOCAB_CHUNK_SIZE = 4096
 __all__ = [
     "DEFAULT_SEQ_CHUNK_SIZE",
     "DEFAULT_VOCAB_CHUNK_SIZE",
+    "apply_rms_norm",
     "gather_label_log_prob_chunked",
+    "gather_log_prob_chunked",
     "logsumexp_last_dim_chunked",
     "token_kd_sum_chunked",
 ]
+
+
+def apply_rms_norm(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Verifier final RMSNorm (matches HF ``model.norm`` before ``lm_head``)."""
+    input_dtype = hidden.dtype
+    hidden = hidden.to(torch.float32)
+    variance = hidden.pow(2).mean(-1, keepdim=True)
+    hidden = hidden * torch.rsqrt(variance + eps)
+    return (weight * hidden).to(input_dtype)
 
 
 def logsumexp_last_dim_chunked(
@@ -102,3 +117,37 @@ def gather_label_log_prob_chunked(
 
     log_z = running_max + running_sum_exp.log()
     return label_logit - log_z
+
+
+def gather_log_prob_chunked(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    *,
+    vocab_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Log-probability of ``token_ids`` under ``logits`` without full softmax."""
+    vocab = logits.shape[-1]
+    running_max = logits.new_full(token_ids.shape, float("-inf"))
+    running_sum_exp = logits.new_zeros(token_ids.shape)
+    token_logit = logits.new_zeros(token_ids.shape)
+
+    for start in range(0, vocab, vocab_chunk_size):
+        end = min(start + vocab_chunk_size, vocab)
+        logits_chunk = logits[..., start:end].float()
+        chunk_max = logits_chunk.amax(dim=-1)
+        chunk_sum_exp = (logits_chunk - chunk_max.unsqueeze(-1)).exp().sum(dim=-1)
+
+        new_max = torch.maximum(running_max, chunk_max)
+        running_sum_exp = (running_max - new_max).exp() * running_sum_exp + (
+            chunk_max - new_max
+        ).exp() * chunk_sum_exp
+        running_max = new_max
+
+        in_chunk = (token_ids >= start) & (token_ids < end)
+        if in_chunk.any():
+            local_idx = (token_ids - start).clamp(min=0, max=end - start - 1)
+            gathered = logits_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)
+            token_logit = torch.where(in_chunk, gathered, token_logit)
+
+    log_z = running_max + running_sum_exp.log()
+    return token_logit - log_z
