@@ -13,6 +13,11 @@ from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.model import SpeculatorModel
 from speculators.models.pard2.config import Pard2SpeculatorConfig
 from speculators.models.pard2.data import build_pard2_prev_prob_batch
+from speculators.models.pard2.loss_ops import (
+    DEFAULT_SEQ_CHUNK_SIZE,
+    DEFAULT_VOCAB_CHUNK_SIZE,
+    token_kd_sum_chunked,
+)
 from speculators.models.utils import resolve_target_layer_ids
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.train.noise_transforms import AddUniformNoise
@@ -21,12 +26,90 @@ from speculators.utils.loading import load_model_layers
 __all__ = [
     "Pard2DraftModel",
     "load_verifier_lm_head",
+    "weighted_ce_kd_loss_chunked",
     "weighted_ce_loss_chunked",
     "weighted_kd_loss_chunked",
 ]
 
-_LOSS_CHUNK_SIZE = 32
 
+def compute_step_acceptance_metrics(
+    prev_prob: torch.Tensor,
+    labels: torch.Tensor,
+    para_num: int,
+    warp_indices: torch.Tensor | None = None,
+    warp_indices_len: torch.Tensor | None = None,
+    warp_single_length: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Estimate per-step acceptance from warped CAT ``prev_prob`` weights.
+
+    The metric is reported as ``acc_{i}`` where ``i`` is the
+    PARD-2 parallel draft block index in ``[0, para_num)``.
+    """
+    if para_num <= 0 or labels.shape[1] <= 1:
+        return {}
+
+    device = prev_prob.device
+    shift_prev_prob = prev_prob[..., 1:].to(dtype=torch.float32)
+    shift_labels = labels[..., 1:]
+    valid_mask = shift_labels != -100
+
+    acceptance_sum = torch.zeros(para_num, device=device, dtype=torch.float32)
+    acceptance_total = torch.zeros(para_num, device=device, dtype=torch.float32)
+    batch_size, seq_len = labels.shape
+
+    for batch_idx in range(batch_size):
+        sample_valid = valid_mask[batch_idx]
+        if not sample_valid.any():
+            continue
+
+        if warp_single_length is None:
+            continue
+        sample_single_len = int(warp_single_length[batch_idx].item())
+        if sample_single_len <= 0:
+            continue
+
+        total_warp_len = sample_single_len * para_num
+        if total_warp_len <= 0:
+            continue
+        base_steps = (
+            torch.arange(total_warp_len, device=device, dtype=torch.long)
+            // sample_single_len
+        )
+
+        if warp_indices is not None and warp_indices_len is not None:
+            sample_idx_len = int(warp_indices_len[batch_idx].item())
+            sample_indices = warp_indices[batch_idx, :sample_idx_len].to(
+                device=device,
+                dtype=torch.long,
+            )
+            sample_indices = sample_indices.clamp(min=0, max=total_warp_len - 1)
+            sample_steps = torch.roll(
+                torch.roll(base_steps.unsqueeze(0), shifts=-1, dims=1)[:, sample_indices],
+                shifts=1,
+                dims=1,
+            ).squeeze(0)
+        else:
+            sample_steps = base_steps
+
+        step_ids = torch.zeros(seq_len, device=device, dtype=torch.long)
+        copy_len = min(int(sample_steps.numel()), seq_len)
+        if copy_len > 0:
+            step_ids[:copy_len] = sample_steps[:copy_len]
+        shift_step_ids = step_ids[1:]
+
+        for step_idx in range(para_num):
+            step_mask = (shift_step_ids == step_idx) & sample_valid
+            if step_mask.any():
+                acceptance_sum[step_idx] = acceptance_sum[step_idx] + shift_prev_prob[
+                    batch_idx
+                ][step_mask].sum()
+                acceptance_total[step_idx] = acceptance_total[step_idx] + step_mask.sum()
+
+    metrics: dict[str, torch.Tensor] = {}
+    for step_idx in range(para_num):
+        metrics[f"acc_{step_idx}_sum"] = acceptance_sum[step_idx]
+        metrics[f"acc_{step_idx}_total"] = acceptance_total[step_idx]
+    return metrics
 
 def weighted_kd_loss_chunked(
     shift_student_logits: torch.Tensor,
@@ -35,34 +118,29 @@ def weighted_kd_loss_chunked(
     temperature: float,
     token_weight: torch.Tensor | None = None,
     *,
-    chunk_size: int = _LOSS_CHUNK_SIZE,
+    chunk_size: int = DEFAULT_SEQ_CHUNK_SIZE,
+    vocab_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
 ) -> torch.Tensor:
     """Memory-efficient KD loss over long sequences.
 
-    Processes the sequence in chunks and uses log_target=True so full vocab
-    probability tensors are never materialized for the whole sequence at once.
+    Processes the sequence in small chunks and the vocabulary in sub-chunks so
+    full ``log_softmax`` tensors are never materialized at once.
     """
-    batch, seq_len, _ = shift_student_logits.shape
-    temp_scale = temperature**2
+    _, seq_len, _ = shift_student_logits.shape
     weighted_sum = shift_student_logits.new_zeros(())
     weight_sum = shift_student_logits.new_zeros(())
 
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
-        student_chunk = shift_student_logits[:, start:end].float()
+        student_chunk = shift_student_logits[:, start:end]
         teacher_chunk = shift_teacher_hidden[:, start:end].to(dtype=lm_head.weight.dtype)
-        teacher_logits = lm_head(teacher_chunk).float()
+        teacher_logits = lm_head(teacher_chunk)
 
-        teacher_log_prob = F.log_softmax(teacher_logits / temperature, dim=-1)
-        student_log_prob = F.log_softmax(student_chunk / temperature, dim=-1)
-        token_kd = (
-            F.kl_div(
-                student_log_prob,
-                teacher_log_prob,
-                reduction="none",
-                log_target=True,
-            ).sum(dim=-1)
-            * temp_scale
+        token_kd = token_kd_sum_chunked(
+            student_chunk,
+            teacher_logits,
+            temperature,
+            vocab_chunk_size=vocab_chunk_size,
         )
 
         if token_weight is not None:
@@ -73,6 +151,8 @@ def weighted_kd_loss_chunked(
             weighted_sum = weighted_sum + token_kd.sum()
             weight_sum = weight_sum + token_kd.numel()
 
+        del teacher_logits, token_kd
+
     return weighted_sum / weight_sum.clamp_min(1e-6)
 
 
@@ -81,7 +161,7 @@ def weighted_ce_loss_chunked(
     shift_labels: torch.Tensor,
     token_weight: torch.Tensor,
     *,
-    chunk_size: int = _LOSS_CHUNK_SIZE,
+    chunk_size: int = DEFAULT_SEQ_CHUNK_SIZE,
 ) -> torch.Tensor:
     """Memory-efficient weighted CE over long PARD-2 warped sequences."""
     _, seq_len, vocab_size = shift_student_logits.shape
@@ -90,11 +170,11 @@ def weighted_ce_loss_chunked(
 
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
-        student_chunk = shift_student_logits[:, start:end].float()
+        student_chunk = shift_student_logits[:, start:end]
         labels_chunk = shift_labels[:, start:end]
-        weight_chunk = token_weight[:, start:end].to(student_chunk.dtype)
+        weight_chunk = token_weight[:, start:end].to(dtype=torch.float32)
         ce_chunk = F.cross_entropy(
-            student_chunk.reshape(-1, vocab_size),
+            student_chunk.float().reshape(-1, vocab_size),
             labels_chunk.reshape(-1),
             reduction="none",
             ignore_index=-100,
@@ -103,6 +183,60 @@ def weighted_ce_loss_chunked(
         weight_sum = weight_sum + weight_chunk.sum()
 
     return weighted_sum / weight_sum.clamp_min(1e-6)
+
+
+def weighted_ce_kd_loss_chunked(
+    shift_student_logits: torch.Tensor,
+    shift_labels: torch.Tensor,
+    shift_teacher_hidden: torch.Tensor,
+    lm_head: nn.Linear,
+    token_weight: torch.Tensor,
+    temperature: float,
+    ce_alpha: float,
+    kd_alpha: float,
+    *,
+    chunk_size: int = DEFAULT_SEQ_CHUNK_SIZE,
+    vocab_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused CE + KD over sequence chunks to reduce peak activation memory."""
+    _, seq_len, vocab_size = shift_student_logits.shape
+    ce_weighted_sum = shift_student_logits.new_zeros(())
+    kd_weighted_sum = shift_student_logits.new_zeros(())
+    weight_sum = shift_student_logits.new_zeros(())
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        student_chunk = shift_student_logits[:, start:end]
+        labels_chunk = shift_labels[:, start:end]
+        weight_chunk = token_weight[:, start:end].to(dtype=torch.float32)
+
+        ce_chunk = F.cross_entropy(
+            student_chunk.float().reshape(-1, vocab_size),
+            labels_chunk.reshape(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).view_as(labels_chunk)
+
+        teacher_chunk = shift_teacher_hidden[:, start:end].to(dtype=lm_head.weight.dtype)
+        teacher_logits = lm_head(teacher_chunk)
+        token_kd = token_kd_sum_chunked(
+            student_chunk,
+            teacher_logits,
+            temperature,
+            vocab_chunk_size=vocab_chunk_size,
+        )
+
+        ce_weighted_sum = ce_weighted_sum + (ce_chunk * weight_chunk).sum()
+        kd_weighted_sum = kd_weighted_sum + (token_kd * weight_chunk).sum()
+        weight_sum = weight_sum + weight_chunk.sum()
+
+        del teacher_logits, token_kd, ce_chunk
+
+    denom = weight_sum.clamp_min(1e-6)
+    ce_loss = ce_weighted_sum / denom
+    kd_loss = kd_weighted_sum / denom
+    final_loss = ce_loss * ce_alpha + kd_loss * kd_alpha
+    return final_loss, ce_loss, kd_loss
 
 
 def load_verifier_lm_head(path: str) -> nn.Linear:
@@ -186,6 +320,7 @@ class Pard2DraftModel(SpeculatorModel):
         gold_teacher_hidden: torch.Tensor | None = None,
         gold_labels: torch.Tensor | None = None,
         gold_seq_len: torch.Tensor | None = None,
+        warp_single_length: torch.Tensor | None = None,
         warp_indices: torch.Tensor | None = None,
         warp_indices_len: torch.Tensor | None = None,
         **kwargs: Any,
@@ -263,46 +398,64 @@ class Pard2DraftModel(SpeculatorModel):
             else:
                 token_weight = valid_mask
 
-            ce_loss = weighted_ce_loss_chunked(
-                student_logits[..., :-1, :],
-                shift_labels,
-                token_weight,
-            )
-
-        if teacher_hidden is not None:
+        has_teacher = teacher_hidden is not None
+        if labels is not None and has_teacher and token_weight is not None:
             teacher_hidden_t = teacher_hidden.to(
                 device=student_logits.device,
                 dtype=student_logits.dtype,
             )
-            shift_student_logits = student_logits[..., :-1, :]
-            shift_teacher_hidden = teacher_hidden_t[..., :-1, :]
-
+            final_loss, ce_loss, kd_loss = weighted_ce_kd_loss_chunked(
+                student_logits[..., :-1, :],
+                shift_labels,
+                teacher_hidden_t[..., :-1, :],
+                self.verifier_lm_head,
+                token_weight,
+                float(self.kd_temperature),
+                float(self.ce_alpha),
+                float(self.kd_alpha),
+            )
+        else:
             if labels is not None and token_weight is not None:
-                kd_weight = token_weight
-            elif prev_prob is not None and self.prev_prob_loss:
-                kd_weight = prev_prob[..., 1:].to(
+                ce_loss = weighted_ce_loss_chunked(
+                    student_logits[..., :-1, :],
+                    shift_labels,
+                    token_weight,
+                )
+
+            if has_teacher:
+                teacher_hidden_t = teacher_hidden.to(
                     device=student_logits.device,
                     dtype=student_logits.dtype,
                 )
+                shift_student_logits = student_logits[..., :-1, :]
+                shift_teacher_hidden = teacher_hidden_t[..., :-1, :]
+
+                if labels is not None and token_weight is not None:
+                    kd_weight = token_weight
+                elif prev_prob is not None and self.prev_prob_loss:
+                    kd_weight = prev_prob[..., 1:].to(
+                        device=student_logits.device,
+                        dtype=student_logits.dtype,
+                    )
+                else:
+                    kd_weight = None
+
+                kd_loss = weighted_kd_loss_chunked(
+                    shift_student_logits,
+                    shift_teacher_hidden,
+                    self.verifier_lm_head,
+                    float(self.kd_temperature),
+                    kd_weight,
+                )
+
+            if ce_loss is not None and kd_loss is not None:
+                final_loss = ce_loss * self.ce_alpha + kd_loss * self.kd_alpha
+            elif ce_loss is not None:
+                final_loss = ce_loss
+            elif kd_loss is not None:
+                final_loss = kd_loss
             else:
-                kd_weight = None
-
-            kd_loss = weighted_kd_loss_chunked(
-                shift_student_logits,
-                shift_teacher_hidden,
-                self.verifier_lm_head,
-                float(self.kd_temperature),
-                kd_weight,
-            )
-
-        if ce_loss is not None and kd_loss is not None:
-            final_loss = ce_loss * self.ce_alpha + kd_loss * self.kd_alpha
-        elif ce_loss is not None:
-            final_loss = ce_loss
-        elif kd_loss is not None:
-            final_loss = kd_loss
-        else:
-            raise ValueError("No loss was computed")
+                raise ValueError("No loss was computed")
 
         metrics: dict[str, torch.Tensor] = {
             "loss_sum": final_loss.detach().clone(),
@@ -314,6 +467,16 @@ class Pard2DraftModel(SpeculatorModel):
         if kd_loss is not None:
             metrics["kd_loss_sum"] = kd_loss.detach().clone()
             metrics["kd_loss_total"] = torch.tensor(1.0, device=final_loss.device)
+        if prev_prob is not None and labels is not None and warp_single_length is not None:
+            step_acceptance_metrics = compute_step_acceptance_metrics(
+                prev_prob=prev_prob,
+                labels=labels,
+                para_num=int(self.config.para_num),
+                warp_indices=warp_indices,
+                warp_indices_len=warp_indices_len,
+                warp_single_length=warp_single_length,
+            )
+            metrics.update(step_acceptance_metrics)
 
         return None, final_loss, metrics
 

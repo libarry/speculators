@@ -9,6 +9,11 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from speculators.models.pard2.loss_ops import (
+    DEFAULT_VOCAB_CHUNK_SIZE,
+    gather_label_log_prob_chunked,
+)
+
 IGNORE_LABEL = -100
 BatchType = dict[str, Any]
 
@@ -119,17 +124,14 @@ def compute_teacher_gold_prob(
     teacher_hidden: torch.Tensor,
     lm_head_weight: torch.Tensor,
     lm_head_bias: torch.Tensor | None = None,
+    *,
+    vocab_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
 ) -> torch.Tensor:
     """Gold-token probability from verifier hidden states and lm_head.
 
     For each position t>0, computes P_teacher(x_t | h_{t-1}) via the verifier
     lm_head. Used to build CAT ``prev_prob`` weights for CE/KD loss.
     """
-    logits = F.linear(
-        teacher_hidden.float(),
-        lm_head_weight,
-        lm_head_bias,
-    )
     teacher_gold_prob = torch.ones(
         input_ids.shape,
         dtype=torch.float32,
@@ -138,12 +140,15 @@ def compute_teacher_gold_prob(
     if input_ids.shape[1] <= 1:
         return teacher_gold_prob
 
-    shift_logits = logits[:, :-1, :].float()
-    shift_labels = input_ids[:, 1:].unsqueeze(-1)
-    gold_log_prob = F.log_softmax(shift_logits, dim=-1).gather(
-        dim=-1,
-        index=shift_labels,
-    ).squeeze(-1)
+    shift_hidden = teacher_hidden[:, :-1, :]
+    shift_labels = input_ids[:, 1:]
+    gold_log_prob = gather_label_log_prob_chunked(
+        shift_hidden,
+        shift_labels,
+        lm_head_weight,
+        lm_head_bias,
+        vocab_chunk_size=vocab_chunk_size,
+    )
     teacher_gold_prob[:, 1:] = gold_log_prob.exp()
     return teacher_gold_prob
 

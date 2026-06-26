@@ -1,6 +1,7 @@
 import logging
 import math
 import warnings
+from pathlib import Path
 from typing import Literal, NamedTuple
 
 import torch
@@ -62,6 +63,8 @@ class TrainerConfig(NamedTuple):
     scheduler_min_lr_rate: float | None = None
     gradient_accumulation_steps: int = 1
     checkpoint_freq: float = 1
+    checkpoint_steps: int | None = None
+    auto_convert_pard2_checkpoint: bool = False
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
@@ -93,11 +96,29 @@ class Trainer:
         self.setup_optimizer()
 
     def setup_trainer(self):
-        if self.checkpointer.previous_epoch != -1:
+        grad_accum = max(1, self.config.gradient_accumulation_steps)
+        optimizer_steps_per_epoch = max(1, math.ceil(len(self.train_loader) / grad_accum))
+        if self.checkpointer.previous_checkpoint is not None:
             root_logger.info(f"Found checkpoint at {self.checkpointer.prev_path}.")
-            self.current_epoch = self.checkpointer.previous_epoch + 1
+            if self.checkpointer.previous_epoch != -1:
+                if self.checkpointer.previous_checkpoint.isdigit():
+                    self.current_epoch = self.checkpointer.previous_epoch + 1
+                else:
+                    self.current_epoch = self.checkpointer.previous_epoch
+            elif self.resume_from_checkpoint and self.checkpointer.previous_global_step > 0:
+                self.current_epoch = (
+                    self.checkpointer.previous_global_step // optimizer_steps_per_epoch
+                )
+            else:
+                self.current_epoch = 0
             if self.resume_from_checkpoint:
                 root_logger.info(f"Resuming training on {self.current_epoch} epoch.")
+                root_logger.info(
+                    "Resume details: "
+                    f"checkpoint={self.checkpointer.previous_checkpoint}, "
+                    f"global_step={self.checkpointer.previous_global_step}, "
+                    f"current_epoch={self.current_epoch}"
+                )
             else:
                 root_logger.warning(
                     "`resume_from_checkpoint` is False, starting "
@@ -111,10 +132,12 @@ class Trainer:
                 f"'{self.checkpointer.path}'. Starting fresh training run."
             )
             self.current_epoch = 0
-        self.global_step = 0
+        self.global_step = (
+            self.checkpointer.previous_global_step if self.resume_from_checkpoint else 0
+        )
         self.best_val_loss = float("inf")
 
-        if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
+        if self.resume_from_checkpoint and self.checkpointer.previous_checkpoint is not None:
             saved = self.checkpointer.load_best_val_loss()
             if saved is not None:
                 self.best_val_loss = saved
@@ -128,7 +151,7 @@ class Trainer:
 
         self.model.to(self.config.hidden_states_dtype)  # type: ignore[arg-type]
         load_checkpoint = (
-            self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
+            self.resume_from_checkpoint and self.checkpointer.previous_checkpoint is not None
         )
 
         if not self.is_distributed:
@@ -167,9 +190,10 @@ class Trainer:
         # 2D weight matrices, AdamW for everything else); "adamw" returns a single one.
         self.optimizers = build_optimizers(self.model, self.config)
         last_epoch = -1
-        if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
+        if self.resume_from_checkpoint and self.checkpointer.previous_checkpoint is not None:
             self.checkpointer.load_optimizer_state_dict(self.model, self.optimizers)
-            last_epoch = self.checkpointer.previous_epoch
+            if self.checkpointer.previous_epoch >= 0:
+                last_epoch = self.checkpointer.previous_epoch
 
         # Setup scheduler(s) — one per optimizer so each optimizer's base LR (e.g.
         # Muon's higher LR vs AdamW's) is warmed up / decayed independently.
@@ -219,7 +243,7 @@ class Trainer:
 
         self.schedulers = [make_scheduler(opt) for opt in self.optimizers]
 
-        if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
+        if self.resume_from_checkpoint and self.checkpointer.previous_checkpoint is not None:
             self.checkpointer.load_scheduler_state_dict(self.schedulers)
 
     def _optimizers_zero_grad(self):
@@ -304,8 +328,19 @@ class Trainer:
                     extra={"step": self.global_step},
                 )
             self.global_step += 1
+            saved_this_step = False
 
             if (
+                self.config.checkpoint_steps is not None
+                and self.config.checkpoint_steps > 0
+                and self.global_step % self.config.checkpoint_steps == 0
+            ):
+                self.maybe_save_checkpoint(f"step_{self.global_step}")
+                saved_this_step = True
+
+            if (
+                not saved_this_step
+                and
                 step_interval is not None
                 and not self.config.save_best
                 and local_step % step_interval == 0
@@ -373,7 +408,33 @@ class Trainer:
         self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
         if self.schedulers:
             self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
+        self._maybe_auto_convert_pard2_checkpoint(epoch)
         root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(epoch)}")
+
+    def _maybe_auto_convert_pard2_checkpoint(self, checkpoint_label: int | str):
+        if not self.config.auto_convert_pard2_checkpoint:
+            return
+
+        checkpoint_dir = Path(self.checkpointer.path) / str(checkpoint_label)
+        if not checkpoint_dir.exists():
+            return
+
+        try:
+            from speculators.models.pard2.export import (  # noqa: PLC0415
+                convert_checkpoint_for_infer,
+            )
+
+            result = convert_checkpoint_for_infer(str(checkpoint_dir))
+            root_logger.info(
+                f"Auto-converted PARD-2 checkpoint at {checkpoint_dir} "
+                f"(base_tensors={result['base_tensors']}, "
+                f"warp_tensors={result['warp_tensors']})"
+            )
+        except Exception as exc:  # noqa: BLE001
+            root_logger.warning(
+                "Failed to auto-convert PARD-2 checkpoint at "
+                f"{checkpoint_dir}: {exc}"
+            )
 
     def maybe_update_best(self, epoch: int, val_metrics: dict | None):
         if val_metrics is None or "loss_epoch" not in val_metrics:
@@ -385,6 +446,7 @@ class Trainer:
             self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
             if self.schedulers:
                 self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
+            self._maybe_auto_convert_pard2_checkpoint(epoch)
         elif self.config.checkpoint_freq >= 1 and not (
             epoch == 0 or (epoch + 1) % int(self.config.checkpoint_freq) == 0
         ):

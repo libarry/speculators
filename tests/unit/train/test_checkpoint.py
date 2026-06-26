@@ -291,3 +291,63 @@ def test_graceful_shutdown_saves_interrupted_checkpoint(
     trainer.run_training()
 
     assert "interrupted" in saved_labels
+
+
+def test_auto_convert_pard2_checkpoint_runs_after_save(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    trainer = _make_minimal_trainer(tmp_path, checkpoint_freq=1, save_best=False)
+    trainer.config = trainer.config._replace(auto_convert_pard2_checkpoint=True)
+
+    (tmp_path / "step_2").mkdir()
+    (tmp_path / "step_2" / "model.safetensors").touch()
+
+    convert_calls: list[str] = []
+
+    def fake_import(name, *args, **kwargs):
+        if name == "speculators.models.pard2.export":
+            class _FakeModule:
+                @staticmethod
+                def convert_checkpoint_for_infer(path: str):
+                    convert_calls.append(path)
+                    return {"base_tensors": 1, "warp_tensors": 1}
+
+            return _FakeModule()
+        return original_import(name, *args, **kwargs)
+
+    import builtins
+
+    original_import = builtins.__import__
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    trainer._maybe_auto_convert_pard2_checkpoint("step_2")
+
+    assert convert_calls == [str(tmp_path / "step_2")]
+
+
+def test_previous_checkpoint_can_resume_from_step_checkpoint(tmp_path: Path):
+    (tmp_path / "0").mkdir()
+    step_dir = tmp_path / "step_120"
+    step_dir.mkdir()
+
+    cp = SingleGPUCheckpointer(str(tmp_path))
+    assert cp.previous_checkpoint == "step_120"
+    assert cp.previous_global_step == 120
+    assert cp.previous_epoch == -1
+
+
+def test_setup_trainer_recovers_epoch_from_step_checkpoint(tmp_path: Path):
+    (tmp_path / "step_6").mkdir()
+    trainer = _make_minimal_trainer(tmp_path, checkpoint_freq=1, save_best=False)
+    trainer.train_loader = cast("DataLoader[Any]", [None] * 10)
+    trainer.config = trainer.config._replace(
+        resume_from_checkpoint=True,
+        gradient_accumulation_steps=2,
+        num_epochs=4,
+    )
+    trainer.resume_from_checkpoint = True
+
+    trainer.setup_trainer()
+
+    assert trainer.global_step == 6
+    assert trainer.current_epoch == 1

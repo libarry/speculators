@@ -412,7 +412,11 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
             **vars(args),
         )
 
-    # Get target layer IDs from the model (resolved at model level)
+    if args.speculator_type == "pard2" and hasattr(
+        draft_model, "gradient_checkpointing_enable"
+    ):
+        draft_model.gradient_checkpointing_enable()
+        logging.info("Enabled gradient checkpointing for PARD-2 draft model.")
     num_target_layers = len(draft_model.target_layer_ids)
 
     if args.speculator_type == "mtp":
@@ -575,6 +579,8 @@ def main(args: argparse.Namespace):  # noqa: C901, PLR0912
         scheduler_min_lr_rate=args.scheduler_min_lr_rate,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         checkpoint_freq=args.checkpoint_freq,
+        checkpoint_steps=args.checkpoint_steps,
+        auto_convert_pard2_checkpoint=args.speculator_type == "pard2",
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
@@ -602,6 +608,13 @@ def _checkpoint_freq(value: str) -> float:
             "as epoch counts and must be whole numbers."
         )
     return fvalue
+
+
+def _checkpoint_steps(value: str) -> int:
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError("--checkpoint-steps must be > 0")
+    return ivalue
 
 
 def _resolve_pard2_verifier_hidden_state_index(
@@ -1015,6 +1028,12 @@ def parse_args():
         default=1.0,
         help="Save a checkpoint every N epochs. Values < 1 enable sub-epoch "
         "checkpointing (e.g. 0.5 = every half epoch).",
+    )
+    parser.add_argument(
+        "--checkpoint-steps",
+        type=_checkpoint_steps,
+        default=None,
+        help="Save a checkpoint every N optimizer steps/iterations.",
     )
     parser.add_argument(
         "--save-best",

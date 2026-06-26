@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import torch
 from torch.utils.data import DataLoader
@@ -93,3 +93,51 @@ def test_train_epoch_steps_optimizer_every_accumulation(tmp_path):
 
     assert step_counter["count"] == 3
     assert trainer.global_step == 3
+
+
+def test_train_epoch_saves_checkpoint_every_n_steps(tmp_path):
+    model = _StubModel()
+    loader = DataLoader(
+        _ScalarBatchDataset([1.0, 2.0, 3.0, 4.0]),
+        batch_size=1,
+        collate_fn=_collate_scalar_batch,
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = TrainerConfig(
+        lr=1e-2,
+        num_epochs=1,
+        save_path=str(tmp_path),
+        resume_from_checkpoint=False,
+        is_distributed=False,
+        rank=0,
+        local_rank=0,
+        scheduler_type="none",
+        gradient_accumulation_steps=1,
+        checkpoint_steps=2,
+        log_freq=1,
+    )
+    trainer.model = cast("SpeculatorModel", model)
+    trainer.local_rank = torch.device("cpu")
+    trainer.rank = 0
+    trainer.is_distributed = False
+    trainer.resume_from_checkpoint = False
+    trainer.train_loader = loader
+    trainer.val_loader = None
+    trainer.global_step = 0
+    trainer.checkpointer = MagicMock()
+    trainer.optimizers = [optimizer]
+    trainer.schedulers = []
+
+    trainer.train_epoch(0)
+
+    assert trainer.global_step == 4
+    trainer.checkpointer.save_checkpoint.assert_has_calls(
+        [
+            call(trainer.model, trainer.optimizers, "step_2"),
+            call(trainer.model, trainer.optimizers, "step_4"),
+        ]
+    )
+    assert trainer.checkpointer.save_checkpoint.call_count == 2

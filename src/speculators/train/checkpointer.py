@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import shutil
 from abc import abstractmethod
 from pathlib import Path
@@ -51,12 +52,16 @@ class BaseCheckpointer:
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
-        self.previous_epoch = self._get_previous_epoch()
-
-        if self.previous_epoch != -1:
-            self.prev_path: Path | None = self.path / str(self.previous_epoch)
-        else:
-            self.prev_path = None
+        self.previous_checkpoint = self._get_previous_checkpoint()
+        self.previous_epoch = self._extract_epoch_from_checkpoint(self.previous_checkpoint)
+        self.previous_global_step = self._extract_global_step_from_checkpoint(
+            self.previous_checkpoint
+        )
+        self.prev_path = (
+            self.path / self.previous_checkpoint
+            if self.previous_checkpoint is not None
+            else None
+        )
 
     @abstractmethod
     def load_model_state_dict(
@@ -74,7 +79,9 @@ class BaseCheckpointer:
         raise NotImplementedError
 
     def load_scheduler_state_dict(self, scheduler: SchedulerOrList):
-        scheduler_path = self.scheduler_path(self.previous_epoch)
+        if self.previous_checkpoint is None:
+            return
+        scheduler_path = self.scheduler_path(self.previous_checkpoint)
         if not scheduler_path.exists():
             return
         loaded = torch.load(scheduler_path, weights_only=True)
@@ -100,10 +107,35 @@ class BaseCheckpointer:
     ):
         raise NotImplementedError
 
-    def _get_previous_epoch(self) -> int:
-        if not self.path.exists():
+    @staticmethod
+    def _extract_epoch_from_checkpoint(checkpoint: str | None) -> int:
+        if checkpoint is None:
             return -1
-        last_checkpoint_num = -1
+        if checkpoint.isdigit():
+            return int(checkpoint)
+        step_with_epoch = re.match(r"^step_\d+_epoch_(\d+)$", checkpoint)
+        if step_with_epoch:
+            return int(step_with_epoch.group(1))
+        return -1
+
+    @staticmethod
+    def _extract_global_step_from_checkpoint(checkpoint: str | None) -> int:
+        if checkpoint is None:
+            return 0
+        step_match = re.match(r"^step_(\d+)(?:_epoch_\d+)?$", checkpoint)
+        if step_match:
+            return int(step_match.group(1))
+        return 0
+
+    def _get_previous_epoch(self) -> int:
+        checkpoint = self._get_previous_checkpoint()
+        return self._extract_epoch_from_checkpoint(checkpoint)
+
+    def _get_previous_checkpoint(self) -> str | None:
+        if not self.path.exists():
+            return None
+        last_checkpoint_name: str | None = None
+        last_checkpoint_mtime = -1.0
         for d in self.path.iterdir():
             if d.is_dir():
                 if d.name == "interrupted":
@@ -113,11 +145,15 @@ class BaseCheckpointer:
                         "(e.g., 'mv interrupted 5' to resume as epoch 5)."
                     )
                     continue
-                try:
-                    last_checkpoint_num = max(last_checkpoint_num, int(d.name))
-                except ValueError:
-                    continue
-        return last_checkpoint_num
+                if (
+                    d.name.isdigit()
+                    or re.match(r"^step_\d+(?:_epoch_\d+)?$", d.name) is not None
+                ):
+                    mtime = d.stat().st_mtime
+                    if mtime >= last_checkpoint_mtime:
+                        last_checkpoint_mtime = mtime
+                        last_checkpoint_name = d.name
+        return last_checkpoint_name
 
     def model_path(self, epoch: int | str):
         model_fname = "model.safetensors"
@@ -173,12 +209,18 @@ class BaseCheckpointer:
         self, model: PreTrainedModel, epoch: int, float_dtype: torch.dtype | None = None
     ):
         """Temporarily load weights for a specific epoch."""
+        old_checkpoint = self.previous_checkpoint
         old_epoch = self.previous_epoch
+        old_global_step = self.previous_global_step
         try:
+            self.previous_checkpoint = str(epoch)
             self.previous_epoch = epoch
+            self.previous_global_step = 0
             self.load_model_state_dict(model, float_dtype=float_dtype)
         finally:
+            self.previous_checkpoint = old_checkpoint
             self.previous_epoch = old_epoch
+            self.previous_global_step = old_global_step
 
     def update_best_symlink(self, epoch: int):
         best_path = self.best_path()
@@ -243,9 +285,11 @@ class SingleGPUCheckpointer(BaseCheckpointer):
     def load_model_state_dict(
         self, model: PreTrainedModel, float_dtype: torch.dtype | None = None
     ):
+        if self.previous_checkpoint is None:
+            raise FileNotFoundError("No checkpoint available to load model state")
         device = get_current_device()
         full_state_dict = load_safetensors_state_dict(
-            self.model_path(self.previous_epoch),
+            self.model_path(self.previous_checkpoint),
             device,
         )
         full_state_dict = convert_float_dtype(
@@ -260,9 +304,11 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         optimizer: OptimizerOrList,
         float_dtype: torch.dtype | None = None,
     ):
+        if self.previous_checkpoint is None:
+            raise FileNotFoundError("No checkpoint available to load optimizer state")
         device = get_current_device()
         loaded = torch.load(
-            self.optimizer_path(self.previous_epoch),
+            self.optimizer_path(self.previous_checkpoint),
             weights_only=True,
             map_location=device,
         )
@@ -294,8 +340,10 @@ class DistributedCheckpointer(BaseCheckpointer):
     def load_model_state_dict(
         self, model: PreTrainedModel, float_dtype: torch.dtype | None = None
     ):
+        if self.previous_checkpoint is None:
+            raise FileNotFoundError("No checkpoint available to load model state")
         full_state_dict = load_safetensors_state_dict(
-            self.model_path(self.previous_epoch), "cpu"
+            self.model_path(self.previous_checkpoint), "cpu"
         )
         full_state_dict = convert_float_dtype(
             full_state_dict, float_dtype or model.dtype
@@ -317,9 +365,11 @@ class DistributedCheckpointer(BaseCheckpointer):
         optimizer: OptimizerOrList,
         float_dtype: torch.dtype | None = None,
     ):
+        if self.previous_checkpoint is None:
+            raise FileNotFoundError("No checkpoint available to load optimizer state")
         optimizers = _as_list(optimizer)
         full_state_dict = torch.load(
-            self.optimizer_path(self.previous_epoch),
+            self.optimizer_path(self.previous_checkpoint),
             mmap=True,
             weights_only=True,
             map_location="cpu",
