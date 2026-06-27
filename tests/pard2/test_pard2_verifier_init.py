@@ -29,19 +29,31 @@ def _tiny_cfg() -> LlamaConfig:
     )
 
 
+class _FakeInner(torch.nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [torch.nn.Linear(cfg.hidden_size, cfg.hidden_size)]
+        )
+
+    def forward(self, inputs_embeds=None, **kwargs):
+        del kwargs
+        return type("Out", (), {"last_hidden_state": inputs_embeds})()
+
+
 class _FakeBase(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.config = cfg
         self.embed = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.model = torch.nn.Module()
-        self.model.layers = torch.nn.ModuleList(
-            [torch.nn.Linear(cfg.hidden_size, cfg.hidden_size)]
-        )
+        self.model = _FakeInner(cfg)
         self.lm_head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
 
     def get_input_embeddings(self):
         return self.embed
+
+    def get_output_embeddings(self):
+        return self.lm_head
 
     def forward(self, inputs_embeds=None, **kwargs):
         del kwargs

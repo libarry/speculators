@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
 
 from speculators.config import SpeculatorsConfig, VerifierConfig
@@ -31,9 +32,16 @@ __all__ = [
     "Pard2DraftModel",
     "load_verifier_lm_head",
     "weighted_ce_kd_loss_chunked",
+    "weighted_ce_kd_loss_from_hidden_chunked",
     "weighted_ce_loss_chunked",
     "weighted_kd_loss_chunked",
 ]
+
+# Sequence-chunk size for the hidden-state fused loss. Larger than the
+# logits-based path (``DEFAULT_SEQ_CHUNK_SIZE``) because each chunk is wrapped in
+# activation checkpointing, so the per-chunk logits are transient and recomputed
+# in the backward pass instead of being held resident.
+DEFAULT_HIDDEN_SEQ_CHUNK_SIZE = 256
 
 
 def _shift_parallel_step_ids(
@@ -396,6 +404,101 @@ def weighted_ce_kd_loss_chunked(
     return final_loss, ce_loss, kd_loss
 
 
+def weighted_ce_kd_loss_from_hidden_chunked(
+    shift_draft_hidden: torch.Tensor,
+    draft_lm_weight: torch.Tensor,
+    shift_labels: torch.Tensor,
+    shift_teacher_hidden: torch.Tensor,
+    verifier_lm_weight: torch.Tensor,
+    token_weight: torch.Tensor,
+    temperature: float,
+    ce_alpha: float,
+    kd_alpha: float,
+    *,
+    chunk_size: int = DEFAULT_HIDDEN_SEQ_CHUNK_SIZE,
+    vocab_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
+    use_checkpoint: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused CE + KD computed directly from the draft hidden states.
+
+    This is numerically equivalent to ``weighted_ce_kd_loss_chunked`` called on
+    ``draft_lm_head(shift_draft_hidden)`` but never materializes the full
+    ``[batch, seq, vocab]`` student-logits tensor (~2.5 GB at seq 2k / vocab
+    152k in bf16). Each sequence chunk projects the hidden state to logits inside
+    an activation-checkpointed closure, so those logits are transient in the
+    forward pass and recomputed on demand during backward. Peak activation
+    memory drops from ``O(seq * vocab)`` to ``O(chunk * vocab)``.
+    """
+    _, seq_len, _ = shift_draft_hidden.shape
+    ce_weighted_sum = shift_draft_hidden.new_zeros((), dtype=torch.float32)
+    kd_weighted_sum = shift_draft_hidden.new_zeros((), dtype=torch.float32)
+    weight_sum = shift_draft_hidden.new_zeros((), dtype=torch.float32)
+
+    def _chunk_loss(
+        draft_hidden_chunk: torch.Tensor,
+        teacher_hidden_chunk: torch.Tensor,
+        labels_chunk: torch.Tensor,
+        weight_chunk: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        student_logits = F.linear(draft_hidden_chunk, draft_lm_weight)
+        vocab_size = student_logits.shape[-1]
+        ce_chunk = F.cross_entropy(
+            student_logits.float().reshape(-1, vocab_size),
+            labels_chunk.reshape(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).view_as(labels_chunk)
+
+        teacher_logits = F.linear(teacher_hidden_chunk, verifier_lm_weight)
+        token_kd = token_kd_sum_chunked(
+            student_logits,
+            teacher_logits,
+            temperature,
+            vocab_chunk_size=vocab_chunk_size,
+        )
+        wf = weight_chunk.to(torch.float32)
+        return (ce_chunk * wf).sum(), (token_kd * wf).sum(), wf.sum()
+
+    checkpointing = (
+        use_checkpoint
+        and torch.is_grad_enabled()
+        and shift_draft_hidden.requires_grad
+    )
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        draft_chunk = shift_draft_hidden[:, start:end]
+        teacher_chunk = shift_teacher_hidden[:, start:end].to(
+            dtype=verifier_lm_weight.dtype
+        )
+        labels_chunk = shift_labels[:, start:end]
+        weight_chunk = token_weight[:, start:end]
+
+        if checkpointing:
+            ce_s, kd_s, w_s = checkpoint(
+                _chunk_loss,
+                draft_chunk,
+                teacher_chunk,
+                labels_chunk,
+                weight_chunk,
+                use_reentrant=False,
+            )
+        else:
+            ce_s, kd_s, w_s = _chunk_loss(
+                draft_chunk, teacher_chunk, labels_chunk, weight_chunk
+            )
+
+        ce_weighted_sum = ce_weighted_sum + ce_s
+        kd_weighted_sum = kd_weighted_sum + kd_s
+        weight_sum = weight_sum + w_s
+
+    denom = weight_sum.clamp_min(1e-6)
+    ce_loss = ce_weighted_sum / denom
+    kd_loss = kd_weighted_sum / denom
+    final_loss = ce_loss * ce_alpha + kd_loss * kd_alpha
+    return final_loss, ce_loss, kd_loss
+
+
 def load_verifier_lm_head(path: str) -> nn.Linear:
     weights = load_model_layers(["lm_head.weight"], path)
     weight = weights["lm_head.weight"]
@@ -503,7 +606,18 @@ class Pard2DraftModel(SpeculatorModel):
                 self._target_feat_last_block = idx
                 break
 
+        # Whether to compute the (expensive) acceptance/diagnostic metrics during
+        # ``forward``. These require an extra full-vocab verifier ``lm_head`` pass
+        # plus a full-vocab pass over the student logits, purely for logging. The
+        # trainer disables them on steps that are not going to be logged (see
+        # ``set_metrics_enabled``) so the bulk of training only pays for the loss.
+        self.compute_acceptance_metrics = True
+
         self.post_init()
+
+    def set_metrics_enabled(self, enabled: bool) -> None:
+        """Toggle computation of the logging-only acceptance/diagnostic metrics."""
+        self.compute_acceptance_metrics = bool(enabled)
 
     @property
     def layers(self) -> nn.ModuleList:
@@ -578,17 +692,20 @@ class Pard2DraftModel(SpeculatorModel):
                 norm_eps=self.verifier_norm_eps,
                 gold_teacher_gold_prob=gold_teacher_gold_prob,
             )
-            diag_metrics = compute_teacher_supervision_diagnostics(
-                gold_input_ids,
-                gold_teacher_hidden,
-                gold_seq_len,
-                lm_head.weight.to(device),
-                lm_head.bias.to(device) if lm_head.bias is not None else None,
-                norm_weight,
-                self.verifier_norm_eps,
-                device=device,
-                gold_teacher_gold_prob=gold_teacher_gold_prob,
-            )
+            if self.compute_acceptance_metrics:
+                diag_metrics = compute_teacher_supervision_diagnostics(
+                    gold_input_ids,
+                    gold_teacher_hidden,
+                    gold_seq_len,
+                    lm_head.weight.to(device),
+                    lm_head.bias.to(device) if lm_head.bias is not None else None,
+                    norm_weight,
+                    self.verifier_norm_eps,
+                    device=device,
+                    gold_teacher_gold_prob=gold_teacher_gold_prob,
+                )
+            else:
+                diag_metrics = {}
         else:
             diag_metrics = {}
 
@@ -619,27 +736,33 @@ class Pard2DraftModel(SpeculatorModel):
             ).to(tf_proj.dtype)
             inputs_embeds = inputs_embeds + tf_proj * keep_mask
 
-        outputs = self.draft_model(
+        # Run only the draft transformer (not the built-in ``lm_head``) so the
+        # full ``[batch, seq, vocab]`` logits tensor is never materialized for the
+        # loss. Logits are projected per-chunk inside the fused loss and, only
+        # when needed, on demand for the logging metrics below.
+        draft_hidden = self.draft_model.model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=False,
-        )
+        ).last_hidden_state
+        draft_lm_weight = self.draft_model.get_output_embeddings().weight
+        device = draft_hidden.device
 
-        student_logits = outputs.logits
         ce_loss: torch.Tensor | None = None
         kd_loss: torch.Tensor | None = None
         token_weight: torch.Tensor | None = None
+        student_logits: torch.Tensor | None = None
 
         if labels is not None:
             shift_labels = labels[..., 1:].contiguous()
-            valid_mask = (shift_labels != -100).to(student_logits.dtype)
+            valid_mask = (shift_labels != -100).to(draft_hidden.dtype)
 
             if prev_prob is not None and self.prev_prob_loss:
                 shift_prev_prob = prev_prob[..., 1:].to(
-                    device=student_logits.device,
-                    dtype=student_logits.dtype,
+                    device=device,
+                    dtype=draft_hidden.dtype,
                 )
                 token_weight = valid_mask * shift_prev_prob
             else:
@@ -648,20 +771,24 @@ class Pard2DraftModel(SpeculatorModel):
         has_teacher = teacher_hidden is not None
         if labels is not None and has_teacher and token_weight is not None:
             teacher_hidden_t = teacher_hidden.to(
-                device=student_logits.device,
-                dtype=student_logits.dtype,
+                device=device,
+                dtype=draft_hidden.dtype,
             )
-            final_loss, ce_loss, kd_loss = weighted_ce_kd_loss_chunked(
-                student_logits[..., :-1, :],
+            final_loss, ce_loss, kd_loss = weighted_ce_kd_loss_from_hidden_chunked(
+                draft_hidden[..., :-1, :],
+                draft_lm_weight,
                 shift_labels,
                 teacher_hidden_t[..., :-1, :],
-                self.verifier_lm_head,
+                self.verifier_lm_head.weight.to(device),
                 token_weight,
                 float(self.kd_temperature),
                 float(self.ce_alpha),
                 float(self.kd_alpha),
             )
         else:
+            # Edge paths (CE-only / KD-only / no labels) are rare in PARD-2
+            # training; materialize the logits lazily for them.
+            student_logits = F.linear(draft_hidden, draft_lm_weight)
             if labels is not None and token_weight is not None:
                 ce_loss = weighted_ce_loss_chunked(
                     student_logits[..., :-1, :],
@@ -715,20 +842,29 @@ class Pard2DraftModel(SpeculatorModel):
             metrics["kd_loss_sum"] = kd_loss.detach().clone()
             metrics["kd_loss_total"] = torch.tensor(1.0, device=final_loss.device)
         if (
-            labels is not None
+            self.compute_acceptance_metrics
+            and labels is not None
             and teacher_hidden is not None
             and warp_single_length is not None
         ):
             lm_head = self.verifier_lm_head
-            norm_weight = self.verifier_norm.weight.to(student_logits.device)
+            norm_weight = self.verifier_norm.weight.to(device)
+            # The acceptance metric only needs detached logits; project them here
+            # (under ``no_grad`` so no extra activation graph is built) when the
+            # fused-from-hidden loss path did not already materialize them.
+            if student_logits is None:
+                with torch.no_grad():
+                    metric_logits = F.linear(draft_hidden.detach(), draft_lm_weight)
+            else:
+                metric_logits = student_logits
             step_acceptance_metrics = compute_step_acceptance_metrics(
-                student_logits=student_logits,
+                student_logits=metric_logits,
                 teacher_hidden=teacher_hidden,
                 labels=labels,
                 para_num=int(self.config.para_num),
-                lm_head_weight=lm_head.weight.to(student_logits.device),
+                lm_head_weight=lm_head.weight.to(device),
                 lm_head_bias=(
-                    lm_head.bias.to(student_logits.device)
+                    lm_head.bias.to(device)
                     if lm_head.bias is not None
                     else None
                 ),
@@ -739,6 +875,7 @@ class Pard2DraftModel(SpeculatorModel):
                 warp_single_length=warp_single_length,
             )
             metrics.update(step_acceptance_metrics)
+            del metric_logits
         if diag_metrics:
             metrics.update(diag_metrics)
 

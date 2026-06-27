@@ -276,6 +276,8 @@ class Trainer:
         grad_accum = max(1, self.config.gradient_accumulation_steps)
         self._optimizers_zero_grad()
 
+        set_metrics_enabled = getattr(self.model, "set_metrics_enabled", None)
+
         for local_step, batch in enumerate(train_loader, 1):
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
@@ -283,6 +285,17 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
+
+            # Skip the logging-only (and relatively expensive) acceptance/
+            # diagnostic metrics on steps whose metrics will be discarded, i.e.
+            # micro-steps that are not the final accumulation step or that fall on
+            # a non-logged optimizer step.
+            if callable(set_metrics_enabled):
+                will_log = (
+                    (local_step % grad_accum == 0 or local_step == num_steps)
+                    and self.global_step % self.config.log_freq == 0
+                )
+                set_metrics_enabled(will_log)
 
             _draft_tokens, loss, metrics = self.model(
                 **gpu_batch, **self.config.train_call_kwargs
@@ -359,6 +372,10 @@ class Trainer:
         val_loader = self.val_loader
         if self.rank == 0:
             val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
+
+        set_metrics_enabled = getattr(self.model, "set_metrics_enabled", None)
+        if callable(set_metrics_enabled):
+            set_metrics_enabled(True)
 
         val_metrics: dict[str, float] = {}
         num_batches = len(val_loader)

@@ -77,18 +77,29 @@ def _make_synthetic_arrow_dataset(tmp_path: Path, num_samples: int = 4, seq_len:
 def test_pard2_smoke_train(monkeypatch):
     tiny_cfg = _tiny_verifier_config()
 
+    class _FakeInner(torch.nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([layer])
+
+        def forward(self, inputs_embeds=None, attention_mask=None, position_ids=None, **kwargs):
+            del attention_mask, position_ids, kwargs
+            return type("Out", (), {"last_hidden_state": inputs_embeds})()
+
     class _FakeBase(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.config = tiny_cfg
             self.embed = torch.nn.Embedding(64, 32)
             layer = torch.nn.Linear(32, 32)
-            self.model = torch.nn.Module()
-            self.model.layers = torch.nn.ModuleList([layer])
+            self.model = _FakeInner(layer)
             self.lm_head = torch.nn.Linear(32, 64, bias=False)
 
         def get_input_embeddings(self):
             return self.embed
+
+        def get_output_embeddings(self):
+            return self.lm_head
 
         def forward(self, inputs_embeds=None, attention_mask=None, position_ids=None, **kwargs):
             del attention_mask, position_ids, kwargs
