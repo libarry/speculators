@@ -31,9 +31,9 @@ DATA_FILE="/home/pard2/metamath_qwen3_8b.jsonl"
 OUTPUT_DIR="./output/pard2_qwen3_8b_minimal_online"
 HIDDEN_STATES_DIR="/dev/shm/pard2_hs"      # vLLM 中转目录；cache 模式下持久缓存
 VLLM_PORT=8119
-MAX_SAMPLES=100000
+MAX_SAMPLES=350000
 SEQ_LENGTH=2048
-VLLM_SEQ_LENGTH=16384
+VLLM_SEQ_LENGTH=8192
 EPOCHS=4
 LR=3e-5
 LOG_FREQ=10
@@ -83,7 +83,7 @@ MASK_TOKEN_ID=151670
 SCHEDULER_TYPE="cosine_with_min_lr"
 SCHEDULER_MIN_LR_RATE=0.1
 SCHEDULER_WARMUP_RATIO=0.01
-PER_DEVICE_TRAIN_BATCH_SIZE=4
+PER_DEVICE_TRAIN_BATCH_SIZE=8
 GRADIENT_ACCUMULATION_STEPS=1
 # checkpoint：每 N 个 iteration（optimizer step）保存一次；0 表示关闭
 CHECKPOINT_STEPS=200
@@ -130,15 +130,15 @@ mkdir -p "$HIDDEN_STATES_DIR"
 # ---------------------------------------------------------------------------
 # 阶段 1：数据预处理
 # ---------------------------------------------------------------------------
-# echo "=== 阶段 1/4：数据预处理 ==="
-# python scripts/prepare_data.py \
-#     --model "$VERIFIER" \
-#     --data "$DATA_FILE" \
-#     --output "$OUTPUT_DIR" \
-#     --max-samples "$MAX_SAMPLES" \
-#     --seq-length "$SEQ_LENGTH" \
-#     --num-preprocessing-workers 64 \
-#     --overwrite
+echo "=== 阶段 1/4：数据预处理 ==="
+python scripts/prepare_data.py \
+    --model "$VERIFIER" \
+    --data "$DATA_FILE" \
+    --output "$OUTPUT_DIR" \
+    --max-samples "$MAX_SAMPLES" \
+    --seq-length "$SEQ_LENGTH" \
+    --num-preprocessing-workers 64 \
+    --overwrite
 
 # ---------------------------------------------------------------------------
 # 阶段 2：启动 vLLM（hidden states 提取，训练期间保持运行）
@@ -176,7 +176,7 @@ echo "vLLM 已就绪。"
 # hidden states 由 vLLM 按需生成；COD 重采样仍在 collate 阶段完成
 # ---------------------------------------------------------------------------
 ##############debug#################
-export ASCEND_LAUNCH_BLOCKING=1
+# export ASCEND_LAUNCH_BLOCKING=1
 ##################################
 
 echo "=== 阶段 3/4：PARD-2 在线训练 ==="
