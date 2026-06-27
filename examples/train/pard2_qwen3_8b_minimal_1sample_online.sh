@@ -25,9 +25,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 # ============ 配置 ============
-VERIFIER="/data/models/qwen/Qwen3-8B"              # 目标 verifier（训练监督模型）
-DRAFT="/home/libowen/Qwen3-0.6B/"                # PARD-2 draft 底座
-DATA_FILE="$SCRIPT_DIR/../../../data/metamath_qwen3_8b.jsonl"
+VERIFIER="/home/pard2/Qwen3-8B"              # 目标 verifier（训练监督模型）
+DRAFT="/home/pard2/Qwen3-0.6B"                # PARD-2 draft 底座
+DATA_FILE="/home/pard2/metamath_qwen3_8b.jsonl"
 OUTPUT_DIR="./output/pard2_qwen3_8b_minimal_online"
 HIDDEN_STATES_DIR="/dev/shm/pard2_hs"      # vLLM 中转目录；cache 模式下持久缓存
 VLLM_PORT=8119
@@ -36,10 +36,10 @@ SEQ_LENGTH=2048
 VLLM_SEQ_LENGTH=16384
 EPOCHS=4
 LR=3e-5
-
+LOG_FREQ=10
 # vLLM 推理：可见设备数须等于 VLLM_TP * VLLM_DP（多副本并发处理 hidden states 请求）
-VLLM_GPUS="0,1"
-VLLM_TP=1
+VLLM_GPUS="0,1,2,3"
+VLLM_TP=2
 VLLM_DP=2
 # Ascend 上 ACL graph capture 额外占显存；OOM 时可开 eager 并降低 utilization
 VLLM_GPU_MEMORY_UTIL=0.90
@@ -48,11 +48,11 @@ VLLM_ENFORCE_EAGER=0          # 1=禁用 NPU graph；0=开 graph，配合下方 
 VLLM_COMPILATION_CONFIG='{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
 VLLM_MAX_MODEL_LEN="$VLLM_SEQ_LENGTH"
 # 训练：与 vLLM 卡不重叠
-TRAIN_GPUS="2,3,4,6"
-NUM_TRAIN_GPUS=4
+TRAIN_GPUS="8,9,10,11,12,13,14,15"
+NUM_TRAIN_GPUS=8
 # DataLoader 预取：worker 在训练当前 batch 时提前向 vLLM 发下一批请求
-DATALOADER_NUM_WORKERS=2
-DATALOADER_PREFETCH_FACTOR=4
+DATALOADER_NUM_WORKERS=4
+DATALOADER_PREFETCH_FACTOR=8
 DEVICE_ENV_PREFIX="ASCEND_RT_VISIBLE_DEVICES"      # NVIDIA 环境改为 CUDA_VISIBLE_DEVICES
 
 run_on_devices() {
@@ -82,10 +82,17 @@ MASK_TOKEN_ID=151670
 # train（example_pard2_qwen3.yaml）
 SCHEDULER_TYPE="cosine_with_min_lr"
 SCHEDULER_MIN_LR_RATE=0.1
-SCHEDULER_WARMUP_RATIO=0.03
-PER_DEVICE_TRAIN_BATCH_SIZE=1
+SCHEDULER_WARMUP_RATIO=0.01
+PER_DEVICE_TRAIN_BATCH_SIZE=4
 GRADIENT_ACCUMULATION_STEPS=1
+# checkpoint：每 N 个 iteration（optimizer step）保存一次；0 表示关闭
+CHECKPOINT_STEPS=200
 # =======================================
+
+CHECKPOINT_STEPS_ARGS=()
+if [[ "$CHECKPOINT_STEPS" -gt 0 ]]; then
+    CHECKPOINT_STEPS_ARGS=(--checkpoint-steps "$CHECKPOINT_STEPS")
+fi
 
 # 将 PARD 的负向层索引转为 vLLM eagle_aux_hidden_state_layer_ids（1-based）
 VLLM_TARGET_LAYER_IDS="$(
@@ -136,40 +143,40 @@ mkdir -p "$HIDDEN_STATES_DIR"
 # ---------------------------------------------------------------------------
 # 阶段 2：启动 vLLM（hidden states 提取，训练期间保持运行）
 # ---------------------------------------------------------------------------
-# echo "=== 阶段 2/4：启动 vLLM 服务 ==="
-# run_on_devices "$VLLM_GPUS" python scripts/launch_vllm.py "$VERIFIER" \
-#     --hidden-states-path "$HIDDEN_STATES_DIR" \
-#     --target-layer-ids $VLLM_TARGET_LAYER_IDS \
-#     --no-include-last-layer \
-#     -- \
-#     --port "$VLLM_PORT" \
-#     --tensor-parallel-size "$VLLM_TP" \
-#     --data-parallel-size "$VLLM_DP" \
-#     --max-model-len "$VLLM_MAX_MODEL_LEN" \
-#     --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTIL" \
-#     --compilation-config "$VLLM_COMPILATION_CONFIG" \
-#     $([ "$VLLM_ENFORCE_EAGER" = "1" ] && echo --enforce-eager) &
-# VLLM_PID=$!
+echo "=== 阶段 2/4：启动 vLLM 服务 ==="
+run_on_devices "$VLLM_GPUS" python scripts/launch_vllm.py "$VERIFIER" \
+    --hidden-states-path "$HIDDEN_STATES_DIR" \
+    --target-layer-ids $VLLM_TARGET_LAYER_IDS \
+    --no-include-last-layer \
+    -- \
+    --port "$VLLM_PORT" \
+    --tensor-parallel-size "$VLLM_TP" \
+    --data-parallel-size "$VLLM_DP" \
+    --max-model-len "$VLLM_MAX_MODEL_LEN" \
+    --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTIL" \
+    --compilation-config "$VLLM_COMPILATION_CONFIG" \
+    $([ "$VLLM_ENFORCE_EAGER" = "1" ] && echo --enforce-eager) &
+VLLM_PID=$!
 
-# cleanup() {
-#     echo "停止 vLLM 服务..."
-#     kill "$VLLM_PID" 2>/dev/null || true
-#     wait "$VLLM_PID" 2>/dev/null || true
-# }
-# trap cleanup EXIT
+cleanup() {
+    echo "停止 vLLM 服务..."
+    kill "$VLLM_PID" 2>/dev/null || true
+    wait "$VLLM_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
 
-# echo "等待 vLLM 就绪..."
-# until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
-#     sleep 2
-# done
-# echo "vLLM 已就绪。"
+echo "等待 vLLM 就绪..."
+until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
+    sleep 2
+done
+echo "vLLM 已就绪。"
 
 # ---------------------------------------------------------------------------
 # 阶段 3：PARD-2 在线训练
 # hidden states 由 vLLM 按需生成；COD 重采样仍在 collate 阶段完成
 # ---------------------------------------------------------------------------
 ##############debug#################
-# export ASCEND_LAUNCH_BLOCKING=1
+export ASCEND_LAUNCH_BLOCKING=1
 ##################################
 
 echo "=== 阶段 3/4：PARD-2 在线训练 ==="
@@ -203,6 +210,8 @@ run_on_devices "$TRAIN_GPUS" torchrun \
     --scheduler-warmup-ratio "$SCHEDULER_WARMUP_RATIO" \
     --per-device-train-batch-size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
     --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS" \
+    "${CHECKPOINT_STEPS_ARGS[@]}" \
+    --log-freq "$LOG_FREQ" \
     --num-workers "$DATALOADER_NUM_WORKERS" \
     --prefetch-factor "$DATALOADER_PREFETCH_FACTOR"
 
@@ -223,4 +232,4 @@ echo "完成。"
 echo "  训练数据:      $OUTPUT_DIR"
 echo "  HS 中转/缓存:  $HIDDEN_STATES_DIR"
 echo "  Checkpoint:    $OUTPUT_DIR/checkpoints"
-echo "  推理导出:      $CKPT_DIR/pard_model/ 与 $CKPT_DIR/warp_model.bin"
+echo "  推理导出:      $CKPT_DIR/pard_model/ 与 $CKPT_DIR/pard_model/warp_model.bin"
