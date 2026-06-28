@@ -94,6 +94,55 @@ def _shift_parallel_step_ids(
     return step_ids[:, 1:]
 
 
+def _raw_warp_index(single_length: int, anchor: int, depth: int) -> int:
+    """Pre-COD warped draft position for ``(anchor, depth)`` in parallel warp."""
+    return depth * single_length + (anchor + depth)
+
+
+def _build_raw_to_filtered_map(
+    single_length: int,
+    para_num: int,
+    warp_indices: torch.Tensor | None,
+    warp_indices_len: int,
+) -> dict[int, int]:
+    """Map pre-COD warped indices to filtered sequence positions."""
+    total_warp_len = single_length * para_num
+    if warp_indices is None or warp_indices_len <= 0:
+        return {raw: raw for raw in range(total_warp_len)}
+
+    raw_to_filtered: dict[int, int] = {}
+    for filt_pos in range(warp_indices_len):
+        raw = int(warp_indices[filt_pos].item())
+        if 0 <= raw < total_warp_len:
+            raw_to_filtered[raw] = filt_pos
+    return raw_to_filtered
+
+
+def _greedy_draft_target_match(
+    student_logits: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    lm_head_bias: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+) -> torch.Tensor:
+    """Greedy verify match: ``draft_argmax == target_argmax`` (PARD infer parity)."""
+    shift_logits = student_logits[..., :-1, :]
+    shift_teacher = teacher_hidden[..., :-1, :]
+    draft_tokens = shift_logits.argmax(dim=-1)
+    teacher_hidden_normed = (
+        apply_rms_norm(shift_teacher, norm_weight, eps=norm_eps)
+        if norm_weight is not None
+        else shift_teacher
+    )
+    target_tokens = F.linear(
+        teacher_hidden_normed,
+        lm_head_weight,
+        lm_head_bias,
+    ).argmax(dim=-1)
+    return draft_tokens == target_tokens
+
+
 def compute_draft_acceptance_prob(
     student_logits: torch.Tensor,
     teacher_hidden: torch.Tensor,
@@ -148,47 +197,71 @@ def compute_step_acceptance_metrics(
     warp_indices_len: torch.Tensor | None = None,
     warp_single_length: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Per parallel-block mean draft acceptance probability ``acc_{i}``."""
+    """Conditional greedy acceptance ``acc_{d}`` aligned with PARD ``accept_ratio``.
+
+    For each original-sequence anchor, walk parallel depths ``0..para_num-1`` and
+    count a match at depth ``d`` only if depths ``0..d-1`` already matched. This is
+    the training-time analogue of PARD inference's per-depth conditional verify rate
+    (``draft_argmax == target_argmax`` at each speculative depth).
+    """
     if para_num <= 0 or labels.shape[1] <= 1 or warp_single_length is None:
         return {}
 
     shift_labels = labels[..., 1:]
     valid_mask = shift_labels != -100
-    shift_step_ids = _shift_parallel_step_ids(
-        labels,
-        para_num,
-        warp_single_length,
-        warp_indices,
-        warp_indices_len,
-    )
-    if shift_step_ids is None:
-        return {}
+    max_shift = shift_labels.shape[1]
 
     device = student_logits.device
-    acceptance_prob = compute_draft_acceptance_prob(
+    greedy_match = _greedy_draft_target_match(
         student_logits,
         teacher_hidden,
-        lm_head_weight,
-        lm_head_bias,
-        norm_weight,
+        lm_head_weight.to(device),
+        lm_head_bias.to(device) if lm_head_bias is not None else None,
+        norm_weight.to(device) if norm_weight is not None else None,
         norm_eps,
-    ).to(device=device, dtype=torch.float32)
+    )
 
     acceptance_sum = torch.zeros(para_num, device=device, dtype=torch.float32)
     acceptance_total = torch.zeros(para_num, device=device, dtype=torch.float32)
     batch_size = labels.shape[0]
 
     for batch_idx in range(batch_size):
-        sample_valid = valid_mask[batch_idx]
-        if not sample_valid.any():
+        single_length = int(warp_single_length[batch_idx].item())
+        if single_length <= 1:
             continue
-        for step_idx in range(para_num):
-            step_mask = (shift_step_ids[batch_idx] == step_idx) & sample_valid
-            if step_mask.any():
-                acceptance_sum[step_idx] = acceptance_sum[step_idx] + acceptance_prob[
-                    batch_idx
-                ][step_mask].sum()
-                acceptance_total[step_idx] = acceptance_total[step_idx] + step_mask.sum()
+
+        sample_warp_indices = None
+        sample_warp_len = 0
+        if warp_indices is not None and warp_indices_len is not None:
+            sample_warp_len = int(warp_indices_len[batch_idx].item())
+            if sample_warp_len > 0:
+                sample_warp_indices = warp_indices[batch_idx, :sample_warp_len]
+
+        raw_to_filtered = _build_raw_to_filtered_map(
+            single_length,
+            para_num,
+            sample_warp_indices,
+            sample_warp_len,
+        )
+
+        for anchor in range(single_length - 1):
+            chain_alive = True
+            for depth in range(para_num):
+                if not chain_alive:
+                    break
+
+                raw_idx = _raw_warp_index(single_length, anchor, depth)
+                filt_pos = raw_to_filtered.get(raw_idx)
+                if filt_pos is None or filt_pos >= max_shift:
+                    break
+                if not bool(valid_mask[batch_idx, filt_pos].item()):
+                    break
+
+                acceptance_total[depth] = acceptance_total[depth] + 1.0
+                if bool(greedy_match[batch_idx, filt_pos].item()):
+                    acceptance_sum[depth] = acceptance_sum[depth] + 1.0
+                else:
+                    chain_alive = False
 
     metrics: dict[str, torch.Tensor] = {}
     for step_idx in range(para_num):
