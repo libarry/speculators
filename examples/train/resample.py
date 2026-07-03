@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-Standalone pipeline: load local open-perfectblend, sample target-model replies
-via an OpenAI-compatible API, and save speculators-ready training data.
-
-No changes to speculators internals — this script is self-contained. After
-sampling it writes JSONL compatible with ``scripts/prepare_data.py``, and can
-optionally invoke ``prepare_data.py`` to emit the Arrow dataset used by
-``scripts/train.py``.
+Load local open-perfectblend, sample target-model replies via an OpenAI-compatible
+API, and save speculators-ready JSONL (role/content format).
 
 Typical usage (vLLM started by script/sever.sh):
 
-    python script/regenerate_open_perfectblend.py \\
+    python examples/train/regenerate_open_perfectblend.py \\
         --dataset-path /home/libowen/spec/open-perfectblend \\
         --endpoint http://127.0.0.1:8000/v1/chat/completions \\
         --api-model qwen \\
-        --prepare-model /data/models/qwen/Qwen3-8B \\
         --output-dir ./output/perfectblend_qwen3_8b \\
         --limit 1000
 
 Outputs (under --output-dir):
-    regenerated.jsonl          # role/content JSONL for prepare_data.py
+    regenerated.jsonl          # JSONL for scripts/prepare_data.py
     regenerated.errors.jsonl   # failed rows (if any)
-    prepared/                  # Arrow dataset (when --prepare-model is set)
+
+Sampling defaults match ``scripts/response_regeneration/script.py``: only
+``model``, ``messages``, and ``max_tokens`` (8192) are sent unless optional
+generation flags are explicitly set.
 """
 
 from __future__ import annotations
@@ -31,7 +28,6 @@ import asyncio
 import glob
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -41,21 +37,12 @@ import aiohttp
 from datasets import load_dataset
 from tqdm import tqdm
 
-ROLE_FROM_MAP = {
-    "human": "user",
-    "gpt": "assistant",
-    "chatgpt": "assistant",
-    "bing": "assistant",
-    "bard": "assistant",
-    "system": "system",
-}
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Load local open-perfectblend, regenerate assistant replies via "
-            "target-model API, and save speculators training data."
+            "Load local open-perfectblend, sample assistant replies via "
+            "target-model API, and save speculators-ready JSONL."
         )
     )
     parser.add_argument(
@@ -74,70 +61,126 @@ def parse_args() -> argparse.Namespace:
         help="Model name in API requests (e.g. qwen). Auto-detected if omitted.",
     )
     parser.add_argument(
-        "--prepare-model",
-        default=None,
-        help=(
-            "HF id or local path for prepare_data.py tokenizer. "
-            "When set, runs prepare_data.py after sampling."
-        ),
-    )
-    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("./output/perfectblend_regen"),
-        help="Directory for regenerated.jsonl and optional prepared/ subdir",
+        help="Directory for regenerated.jsonl and regenerated.errors.jsonl",
     )
-    parser.add_argument("--limit", type=int, default=None, help="Max rows to process")
-    parser.add_argument("--concurrency", type=int, default=32)
-    parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top-p", type=float, default=0.8)
+    parser.add_argument("--limit", type=int, default=None, help="Stop after N rows")
     parser.add_argument(
-        "--disable-thinking",
-        action="store_true",
-        default=True,
-        help="Disable Qwen3 thinking via chat_template_kwargs (default: on)",
+        "--concurrency",
+        type=int,
+        default=64,
+        help="Max concurrent requests (default: 64, same as response_regeneration)",
     )
     parser.add_argument(
-        "--enable-thinking",
-        action="store_true",
-        help="Enable thinking mode (overrides --disable-thinking)",
+        "--max-tokens",
+        type=int,
+        default=8192,
+        help="max_tokens per assistant turn (default: 8192, same as response_regeneration)",
     )
-    parser.add_argument("--resume", action="store_true", help="Skip rows already in output")
-    parser.add_argument("--seq-length", type=int, default=8192)
     parser.add_argument(
-        "--max-samples",
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature (default: unset, use server default)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Nucleus sampling top_p (default: unset, use server default)",
+    )
+    parser.add_argument(
+        "--top-k",
         type=int,
         default=None,
-        help="Cap samples passed to prepare_data.py (default: all regenerated)",
+        help="Top-k sampling via extra_body (default: unset, use server default)",
     )
     parser.add_argument(
-        "--speculators-root",
-        type=Path,
+        "--min-p",
+        type=float,
         default=None,
-        help="Path to speculators repo (for prepare_data.py). Auto-detected.",
+        help="Min-p sampling via extra_body (default: unset, use server default)",
     )
     parser.add_argument(
-        "--skip-prepare",
-        action="store_true",
-        help="Only write regenerated.jsonl, do not run prepare_data.py",
+        "--repetition-penalty",
+        type=float,
+        default=None,
+        help="Repetition penalty as presence_penalty (default: unset)",
     )
+    thinking_group = parser.add_mutually_exclusive_group()
+    thinking_group.add_argument(
+        "--enable-thinking",
+        dest="thinking_mode",
+        action="store_const",
+        const="enable",
+        help="Set chat_template_kwargs.enable_thinking=True",
+    )
+    thinking_group.add_argument(
+        "--disable-thinking",
+        dest="thinking_mode",
+        action="store_const",
+        const="disable",
+        help="Set chat_template_kwargs.enable_thinking=False",
+    )
+    parser.set_defaults(thinking_mode=None)
+    parser.add_argument("--resume", action="store_true", help="Skip rows already in output")
     return parser.parse_args()
 
 
-def find_speculators_root(explicit: Path | None) -> Path:
-    if explicit is not None:
-        prepare = explicit / "scripts" / "prepare_data.py"
-        if not prepare.is_file():
-            raise FileNotFoundError(f"prepare_data.py not found under {explicit}")
-        return explicit
-    here = Path(__file__).resolve().parent
-    for candidate in (here.parent / "speculators", here / "speculators"):
-        if (candidate / "scripts" / "prepare_data.py").is_file():
-            return candidate
-    raise FileNotFoundError(
-        "Could not locate speculators repo. Pass --speculators-root explicitly."
-    )
+def validate_args(args: argparse.Namespace) -> None:
+    if args.temperature is not None and not 0.0 <= args.temperature <= 2.0:
+        raise ValueError("--temperature must be in [0.0, 2.0]")
+    if args.top_p is not None and not 0.0 < args.top_p <= 1.0:
+        raise ValueError("--top-p must be in (0.0, 1.0]")
+    if args.top_k is not None and args.top_k <= 0:
+        raise ValueError("--top-k must be greater than 0")
+    if args.min_p is not None and not 0.0 <= args.min_p <= 1.0:
+        raise ValueError("--min-p must be in [0.0, 1.0]")
+    if args.max_tokens <= 0:
+        raise ValueError("--max-tokens must be greater than 0")
+    if args.concurrency <= 0:
+        raise ValueError("--concurrency must be greater than 0")
+    if args.repetition_penalty is not None and args.repetition_penalty < 0:
+        raise ValueError("--repetition-penalty must be non-negative")
+
+
+def build_chat_payload(
+    api_model: str,
+    messages: list[dict[str, str]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Build chat payload; default fields match response_regeneration/script.py."""
+    payload: dict[str, Any] = {
+        "model": api_model,
+        "messages": messages,
+        "max_tokens": args.max_tokens,
+    }
+    if args.temperature is not None:
+        payload["temperature"] = args.temperature
+    if args.top_p is not None:
+        payload["top_p"] = args.top_p
+    if args.repetition_penalty is not None:
+        payload["presence_penalty"] = args.repetition_penalty
+
+    extra_body: dict[str, Any] = {}
+    if args.top_k is not None:
+        extra_body["top_k"] = args.top_k
+    if args.min_p is not None:
+        extra_body["min_p"] = args.min_p
+    if args.thinking_mode == "enable":
+        extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = True
+    elif args.thinking_mode == "disable":
+        extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+    if extra_body:
+        payload["extra_body"] = extra_body
+
+    return payload
+
+
+def _fmt_optional(value: Any) -> str:
+    return "server default" if value is None else str(value)
 
 
 def resolve_dataset_path(dataset_path: str) -> list[str]:
@@ -253,22 +296,7 @@ async def regenerate_conversation(
         prefix.append({"role": "user", "content": turn["content"]})
         out.append({"role": "user", "content": turn["content"]})
 
-        payload: dict[str, Any] = {
-            "model": api_model,
-            "messages": prefix,
-            "max_tokens": args.max_tokens,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-        }
-        if args.enable_thinking:
-            payload["extra_body"] = {
-                "chat_template_kwargs": {"enable_thinking": True}
-            }
-        elif args.disable_thinking:
-            payload["extra_body"] = {
-                "chat_template_kwargs": {"enable_thinking": False}
-            }
-
+        payload = build_chat_payload(api_model, prefix, args)
         data = await post_chat(session, sem, endpoint, payload)
         choice = data["choices"][0]
         message = choice["message"]
@@ -360,12 +388,20 @@ async def run_sampling(args: argparse.Namespace) -> Path:
     dataset = load_local_dataset(data_files)
     seen = load_seen_indices(out_path) if args.resume else set()
 
-    print(f"Endpoint:      {endpoint}")
-    print(f"API model:     {api_model}")
-    print(f"Dataset files: {len(data_files)} file(s)")
-    print(f"Output:        {out_path}")
-    print(f"Errors:        {err_path}")
-    print(f"Resume:        {args.resume} (skip {len(seen)} indices)")
+    print(f"Endpoint:           {endpoint}")
+    print(f"API model:          {api_model}")
+    print(f"Max tokens:         {args.max_tokens}")
+    print(f"Temperature:        {_fmt_optional(args.temperature)}")
+    print(f"Top-p:              {_fmt_optional(args.top_p)}")
+    print(f"Top-k:              {_fmt_optional(args.top_k)}")
+    print(f"Min-p:              {_fmt_optional(args.min_p)}")
+    print(f"Repetition penalty: {_fmt_optional(args.repetition_penalty)}")
+    print(f"Thinking mode:      {_fmt_optional(args.thinking_mode)}")
+    print(f"Concurrency:        {args.concurrency}")
+    print(f"Dataset files:      {len(data_files)} file(s)")
+    print(f"Output:             {out_path}")
+    print(f"Errors:             {err_path}")
+    print(f"Resume:             {args.resume} (skip {len(seen)} indices)")
     print()
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
@@ -419,80 +455,34 @@ async def run_sampling(args: argparse.Namespace) -> Path:
 
             if stats["ok"]:
                 avg = stats["latency_total"] / stats["ok"]
-                print(f"\nSampled {stats['ok']} rows (errors: {stats['errors']}, avg {avg:.2f}s/row)")
+                print(
+                    f"\nSampled {stats['ok']} rows "
+                    f"(errors: {stats['errors']}, avg {avg:.2f}s/row)"
+                )
             else:
                 print(f"\nNo rows sampled (errors: {stats['errors']})")
 
     return out_path
 
 
-def run_prepare(
-    args: argparse.Namespace,
-    jsonl_path: Path,
-    speculators_root: Path,
-) -> Path:
-    if args.skip_prepare or args.prepare_model is None:
-        return args.output_dir
-
-    prepared_dir = args.output_dir / "prepared"
-    prepare_script = speculators_root / "scripts" / "prepare_data.py"
-    cmd = [
-        sys.executable,
-        str(prepare_script),
-        "--model",
-        args.prepare_model,
-        "--data",
-        str(jsonl_path),
-        "--output",
-        str(prepared_dir),
-        "--seq-length",
-        str(args.seq_length),
-    ]
-    if args.max_samples is not None:
-        cmd.extend(["--max-samples", str(args.max_samples)])
-
-    print("\n=== Running prepare_data.py ===")
-    print(" ".join(cmd))
-    subprocess.run(cmd, check=True)
-    print(f"Prepared dataset: {prepared_dir}")
-    return prepared_dir
-
-
 def main() -> None:
     args = parse_args()
-    if args.enable_thinking:
-        args.disable_thinking = False
-
-    speculators_root = None
-    if not args.skip_prepare and args.prepare_model is not None:
-        speculators_root = find_speculators_root(args.speculators_root)
+    validate_args(args)
 
     jsonl_path = asyncio.run(run_sampling(args))
     ok_count = sum(1 for _ in jsonl_path.open(encoding="utf-8"))
     if ok_count == 0:
-        print("No successful samples; not running prepare_data.py.", file=sys.stderr)
+        print("No successful samples written.", file=sys.stderr)
         sys.exit(1)
 
-    if speculators_root is not None:
-        prepared = run_prepare(args, jsonl_path, speculators_root)
-        print("\nDone.")
-        print(f"  JSONL:     {jsonl_path}")
-        print(f"  Prepared:  {prepared}")
-        print("\nTrain with:")
-        print(
-            f"  --data-path {prepared} "
-            f"--verifier-name-or-path {args.prepare_model} "
-            f"--use-off-policy-tokens"
-        )
-    else:
-        print("\nDone.")
-        print(f"  JSONL: {jsonl_path}")
-        print("\nNext, tokenize for training:")
-        print(
-            f"  python <speculators>/scripts/prepare_data.py "
-            f"--model <tokenizer_path> --data {jsonl_path} "
-            f"--output {args.output_dir / 'prepared'}"
-        )
+    print("\nDone.")
+    print(f"  JSONL: {jsonl_path}")
+    print("\nNext step — tokenize for training:")
+    print(
+        f"  python scripts/prepare_data.py "
+        f"--model <target_model_path> --data {jsonl_path} "
+        f"--output <output_dir>"
+    )
 
 
 if __name__ == "__main__":
