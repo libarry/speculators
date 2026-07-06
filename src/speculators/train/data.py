@@ -3,6 +3,7 @@ import math
 import os
 import random
 import shutil
+import time
 import warnings
 from collections.abc import Callable
 from os import PathLike
@@ -215,14 +216,84 @@ class BaseDataset(Dataset):
         return data
 
 
+# Long-poll fallback for NFS / cross-node visibility (set SPECULATORS_HS_LOAD_TIMEOUT=0
+# to restore the original fail-fast behaviour).
+_HS_LOAD_POLL_TIMEOUT = float(os.environ.get("SPECULATORS_HS_LOAD_TIMEOUT", "300"))
+_HS_LOAD_POLL_INTERVAL = float(os.environ.get("SPECULATORS_HS_LOAD_POLL_INTERVAL", "1.0"))
+_HS_LOAD_LOG_INTERVAL = float(os.environ.get("SPECULATORS_HS_LOAD_LOG_INTERVAL", "10.0"))
+
+
 def _maybe_load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
-    lock_path = str(file_path) + ".lock"
-    if Path(lock_path).exists():
-        wait_for_lock(lock_path)
+    """Load hidden states, polling until the file is visible on shared storage.
 
-    if file_path.exists():
-        return load_file(file_path)
+    vLLM may return the output path before NFS makes the file (or its lock)
+    visible on the training node.  A long poll distinguishes timing issues from
+    hard failures.  Disable with ``SPECULATORS_HS_LOAD_TIMEOUT=0``.
+    """
+    if _HS_LOAD_POLL_TIMEOUT <= 0:
+        lock_path = str(file_path) + ".lock"
+        if Path(lock_path).exists():
+            wait_for_lock(lock_path)
+        if file_path.exists():
+            return load_file(file_path)
+        return None
 
+    lock_path = Path(str(file_path) + ".lock")
+    deadline = time.monotonic() + _HS_LOAD_POLL_TIMEOUT
+    last_log = 0.0
+    attempts = 0
+
+    while time.monotonic() < deadline:
+        attempts += 1
+        remaining = deadline - time.monotonic()
+
+        if lock_path.exists():
+            try:
+                wait_for_lock(
+                    str(lock_path),
+                    timeout=min(30.0, max(0.1, remaining)),
+                )
+            except TimeoutError:
+                pass
+
+        if file_path.exists():
+            try:
+                data = load_file(file_path)
+            except Exception as exc:  # noqa: BLE001
+                warnings.warn(
+                    f"load_file({file_path}) failed (attempt {attempts}): {exc}. "
+                    "Retrying...",
+                    stacklevel=2,
+                )
+            else:
+                if attempts > 1:
+                    warnings.warn(
+                        f"Loaded {file_path} after {attempts} attempts "
+                        f"(>{_HS_LOAD_POLL_INTERVAL}s on shared storage) — "
+                        "likely NFS/cross-node visibility delay.",
+                        stacklevel=2,
+                    )
+                return data
+
+        now = time.monotonic()
+        if now - last_log >= _HS_LOAD_LOG_INTERVAL:
+            warnings.warn(
+                f"Waiting for hidden states at {file_path} "
+                f"(lock_exists={lock_path.exists()}, "
+                f"file_exists={file_path.exists()}, "
+                f"attempt={attempts}, "
+                f"timeout={_HS_LOAD_POLL_TIMEOUT}s)...",
+                stacklevel=2,
+            )
+            last_log = now
+
+        time.sleep(_HS_LOAD_POLL_INTERVAL)
+
+    warnings.warn(
+        f"Timed out after {_HS_LOAD_POLL_TIMEOUT}s waiting for {file_path} "
+        f"(lock_exists={lock_path.exists()}, file_exists={file_path.exists()}).",
+        stacklevel=2,
+    )
     return None
 
 
