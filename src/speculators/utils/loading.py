@@ -53,10 +53,58 @@ def is_config_only_dir(path: str | Path) -> bool:
     return has_config and not has_weights
 
 
+def _list_safetensors_shards(model_path: str) -> list[str]:
+    """List top-level ``*.safetensors`` shard filenames for a local dir or Hub repo."""
+    model_path_obj = Path(model_path)
+    if model_path_obj.is_dir():
+        return sorted(p.name for p in model_path_obj.glob("*.safetensors") if p.is_file())
+
+    from huggingface_hub import list_repo_files  # noqa: PLC0415
+
+    return sorted(
+        f
+        for f in list_repo_files(repo_id=model_path)
+        if f.endswith(".safetensors") and Path(f).name == f
+    )
+
+
+def _build_weight_map_from_safetensors(model_path: str) -> dict[str, str]:
+    """Build a virtual weight_map by scanning all ``*.safetensors`` shards.
+
+    Supports arbitrarily named shards (e.g. ``pytorch_model-00001-of-00002.safetensors``)
+    when ``model.safetensors.index.json`` / ``model.safetensors`` are absent.
+    """
+    shard_files = _list_safetensors_shards(model_path)
+    if not shard_files:
+        raise FileNotFoundError(
+            f"No .safetensors weight files found for {model_path}. "
+            "Expected model.safetensors.index.json, model.safetensors, "
+            "or one or more *.safetensors shards."
+        )
+
+    logger.info(
+        "Building weight_map by scanning {} safetensors file(s) under {}",
+        len(shard_files),
+        model_path,
+    )
+    weight_map: dict[str, str] = {}
+    for shard_file in shard_files:
+        shard_path = _resolve_file(model_path, shard_file)
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key in weight_map:
+                    raise ValueError(
+                        f"Duplicate tensor key '{key}' found in "
+                        f"'{weight_map[key]}' and '{shard_file}'"
+                    )
+                weight_map[key] = shard_file
+    return weight_map
+
+
 def list_checkpoint_keys(checkpoint_dir: str | Path) -> list[str]:
     """List all tensor keys in a checkpoint without loading weights.
 
-    Supports sharded safetensors (via index) and single safetensors formats.
+    Supports sharded safetensors (via index) and single/multi safetensors formats.
 
     :param checkpoint_dir: Path to a local checkpoint directory.
     :return: List of tensor key names present in the checkpoint.
@@ -68,15 +116,7 @@ def list_checkpoint_keys(checkpoint_dir: str | Path) -> list[str]:
         with index_path.open() as f:
             return list(json.load(f)["weight_map"].keys())
 
-    single = checkpoint_dir / "model.safetensors"
-    if single.exists():
-        with safe_open(str(single), framework="pt") as f:
-            return list(f.keys())
-
-    raise FileNotFoundError(
-        f"No safetensors checkpoint found at {checkpoint_dir}. "
-        "Expected model.safetensors.index.json or model.safetensors."
-    )
+    return list(_build_weight_map_from_safetensors(str(checkpoint_dir)).keys())
 
 
 def load_model_layers(
@@ -92,7 +132,7 @@ def load_model_layers(
     containing model.safetensors.index
     :return: dict mapping input names/patterns to loaded tensors
     """
-    # download the index file or build weight map for single-file models
+    # Prefer the HF index when present; otherwise scan all *.safetensors shards.
     try:
         index_file = _resolve_file(model_path, "model.safetensors.index.json")
         with Path(index_file).open() as f:
@@ -101,12 +141,9 @@ def load_model_layers(
     except (FileNotFoundError, EntryNotFoundError):
         logger.warning(
             "`model.safetensors.index.json` file not found. "
-            "Checking for `model.safetensors` instead."
+            "Falling back to scanning *.safetensors files."
         )
-        model_file = _resolve_file(model_path, "model.safetensors")
-        # Build virtual weight map for single-file models
-        with safe_open(model_file, framework="pt", device="cpu") as f:
-            weight_map = dict.fromkeys(f.keys(), "model.safetensors")
+        weight_map = _build_weight_map_from_safetensors(model_path)
 
     # Resolve names: try exact match, then suffix match, then known aliases
     name_to_key = {}  # Maps input name to actual checkpoint key

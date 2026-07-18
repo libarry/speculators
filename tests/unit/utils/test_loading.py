@@ -4,9 +4,11 @@ Unit tests for the loading module in the Speculators library.
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM
 
 from speculators.utils.loading import (
+    _build_weight_map_from_safetensors,
     _resolve_file,
     _resolve_key,
     is_config_only_dir,
@@ -131,6 +133,32 @@ def test_resolve_file_hub_download():
 
 
 # load_model_layers Tests
+
+
+@pytest.mark.smoke
+def test_load_model_layers_scans_arbitrarily_named_shards(tmp_path):
+    """Fallback path should work without model.safetensors(.index.json)."""
+    embed = torch.randn(8, 4)
+    lm_head = torch.randn(8, 4)
+    save_file(
+        {"model.embed_tokens.weight": embed},
+        tmp_path / "pytorch_model-00001-of-00002.safetensors",
+    )
+    save_file(
+        {"lm_head.weight": lm_head},
+        tmp_path / "pytorch_model-00002-of-00002.safetensors",
+    )
+
+    weight_map = _build_weight_map_from_safetensors(str(tmp_path))
+    assert weight_map["model.embed_tokens.weight"].startswith("pytorch_model-")
+    assert weight_map["lm_head.weight"].startswith("pytorch_model-")
+
+    result = load_model_layers(
+        ["model.embed_tokens.weight", "lm_head.weight"],
+        str(tmp_path),
+    )
+    assert torch.equal(result["model.embed_tokens.weight"], embed)
+    assert torch.equal(result["lm_head.weight"], lm_head)
 
 
 @pytest.mark.sanity
