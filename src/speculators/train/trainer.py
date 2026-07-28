@@ -54,7 +54,7 @@ class _StepTimer:
 
     def mark(self, name: str) -> None:
         if self.enabled:
-            torch.cuda.synchronize()
+            torch.npu.synchronize()
             self._marks[name] = time.perf_counter()
 
     def mark_value(self, name: str, value: float) -> None:
@@ -64,7 +64,7 @@ class _StepTimer:
     def now(self) -> float | None:
         if not self.enabled:
             return None
-        torch.cuda.synchronize()
+        torch.npu.synchronize()
         return time.perf_counter()
 
     def profile(self, num_tokens: int) -> dict[str, float] | None:
@@ -88,6 +88,19 @@ class _StepTimer:
             "tokens_per_s": tokens_per_s,
             "fetch_frac": fetch_frac,
         }
+
+
+def _reduce_profile_max(
+    profile: dict[str, float], device: torch.device
+) -> dict[str, float]:
+    """All-reduce MAX over ranks for each profile metric."""
+    keys = list(profile.keys())
+    # HCCL (Ascend) does not support float64 allreduce; use float32.
+    vals = torch.tensor(
+        [profile[k] for k in keys], device=device, dtype=torch.float32
+    )
+    dist.all_reduce(vals, op=dist.ReduceOp.MAX)
+    return {k: v.item() for k, v in zip(keys, vals, strict=True)}
 
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
@@ -475,12 +488,20 @@ class Trainer:
             t_before_fetch = timer.now() or time.perf_counter()
 
             profile = None
+            profile_max = None
             if timer.enabled:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
                 if self.is_distributed:
                     for v in metrics.values():
                         dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
+                    if profile is not None:
+                        profile_max = _reduce_profile_max(
+                            profile,
+                            torch.device(f"{self.device_type}:{self.local_rank}"),
+                        )
+                else:
+                    profile_max = profile
 
                 metrics = {k: v.item() for k, v in metrics.items()}
                 world_size = dist.get_world_size() if self.is_distributed else 1
@@ -494,6 +515,7 @@ class Trainer:
                     {
                         "train": metrics,
                         "profile": profile,
+                        "profile_max": profile_max,
                         "epoch": epoch,
                         "lr": lr_info,
                         "global_step": self.global_step,
