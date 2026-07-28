@@ -34,14 +34,15 @@ from speculators.train.distributed import (
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
 from speculators.train.utils import normalize_counted_metrics
+from speculators.utils.util import synchronize as accelerator_synchronize
 
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
 
 
 class _StepTimer:
-    # Each mark()/now() forces a cuda.synchronize to capture true GPU time.
-    # This serialises the CUDA pipeline, so profiled steps are slower; keep
+    # Each mark()/now() forces a device synchronize to capture true accelerator time.
+    # This serialises the compute pipeline, so profiled steps are slower; keep
     # log_freq > 1 in perf-sensitive runs.
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
@@ -53,7 +54,7 @@ class _StepTimer:
 
     def mark(self, name: str) -> None:
         if self.enabled:
-            torch.cuda.synchronize()
+            accelerator_synchronize()
             self._marks[name] = time.perf_counter()
 
     def mark_value(self, name: str, value: float) -> None:
@@ -63,7 +64,7 @@ class _StepTimer:
     def now(self) -> float | None:
         if not self.enabled:
             return None
-        torch.cuda.synchronize()
+        accelerator_synchronize()
         return time.perf_counter()
 
     def profile(self, num_tokens: int) -> dict[str, float] | None:
@@ -371,7 +372,9 @@ class Trainer:
 
         train_loader = self.train_loader
         if self.rank == 0:
-            train_loader = tqdm(train_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
+            train_loader = tqdm(  # type: ignore[assignment]
+                train_loader, desc=f"Train epoch {epoch}"
+            )
 
         step_interval = (
             max(1, round(num_steps * self.config.checkpoint_freq))
@@ -459,7 +462,9 @@ class Trainer:
             self.val_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
         val_loader = self.val_loader
         if self.rank == 0:
-            val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
+            val_loader = tqdm(  # type: ignore[assignment]
+                val_loader, desc=f"Validation epoch {epoch}"
+            )
 
         val_metrics: dict[str, float] = {}
         num_batches = len(val_loader)

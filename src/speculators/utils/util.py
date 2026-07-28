@@ -52,3 +52,13 @@ def empty_cache():
     if hasattr(mod, "empty_cache"):
         mod.empty_cache()
     return
+
+
+def synchronize() -> None:
+    """Synchronize the current accelerator (CUDA/NPU/...) without hardcoding cuda."""
+    acc = torch.accelerator.current_accelerator()
+    if acc is not None:
+        torch.get_device_module(acc).synchronize()
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import os
 import shutil
+import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -46,6 +47,22 @@ class HiddenStatesTransfer(ABC):
 
     def setup(self) -> None:  # noqa: B027
         """Lazy initialization (safe to call from dataloader worker)."""
+
+    @property
+    def is_setup(self) -> bool:
+        """Whether backend resources are ready for get_generated/cache/delete."""
+        return True
+
+    def reset(self) -> None:  # noqa: B027
+        """Drop process-local state so the next setup() re-initializes cleanly.
+
+        Required after DataLoader fork/spawn: a live Mooncake/RDMA client must
+        not be reused across processes.
+        """
+
+    def clone(self) -> HiddenStatesTransfer:
+        """Return an independent transfer for another dataset/loader."""
+        return self
 
     @abstractmethod
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:
@@ -207,16 +224,48 @@ class MooncakeTransfer(HiddenStatesTransfer):
 
     def __init__(self, store: MooncakeHiddenStatesStore):
         self.store = store
+        # Serialize ADXL ops: many threads may issue vLLM HTTP in parallel, but
+        # AscendDirectTransport is only stable with one in-flight train-side
+        # transfer at a time on a single client.
+        self._adxl_lock = threading.Lock()
+
+    @property
+    def is_setup(self) -> bool:
+        return self.store.is_setup
+
+    def reset(self) -> None:
+        with self._adxl_lock:
+            self.store.reset()
+
+    def clone(self) -> MooncakeTransfer:
+        from hs_connectors.mooncake_store import (  # noqa: PLC0415
+            MooncakeHiddenStatesStore,
+        )
+
+        return MooncakeTransfer(MooncakeHiddenStatesStore(self.store.config))
 
     def setup(self) -> None:
-        if not self.store.is_setup:
-            self.store.setup()
+        with self._adxl_lock:
+            if not self.store.is_setup:
+                self.store.setup()
 
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:  # noqa: ARG002
         return None
 
     def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
-        return self.store.get_sample(handle)
+        # Setup once under lock, but do NOT hold the lock across the poll loop —
+        # otherwise one slow sample blocks all other prefetch threads and amplifies
+        # ADXL connect retries (status 103900 / TRANSFER_FAIL log storms).
+        with self._adxl_lock:
+            if not self.store.is_setup:
+                self.store.setup()
+        return self.store.get_sample(handle, lock=self._adxl_lock)
+
+    def delete(self, handle: str) -> None:
+        with self._adxl_lock:
+            if not self.store.is_setup:
+                self.store.setup()
+            self.store.remove_sample(handle)
 
 
 @HiddenStatesBackend.register("mooncake")
@@ -242,9 +291,12 @@ class MooncakeBackend(HiddenStatesBackend):
         )
         parser.add_argument(
             "--mooncake-protocol",
-            choices=["tcp", "rdma"],
+            choices=["tcp", "rdma", "ascend"],
             default="tcp",
-            help="Mooncake transport protocol. Used with backend=mooncake.",
+            help=(
+                "Mooncake transport protocol. Use 'ascend' on Huawei Ascend NPUs. "
+                "Used with backend=mooncake."
+            ),
         )
 
     @staticmethod
@@ -266,9 +318,12 @@ class MooncakeBackend(HiddenStatesBackend):
         )
         parser.add_argument(
             "--mooncake-protocol",
-            choices=["tcp", "rdma"],
+            choices=["tcp", "rdma", "ascend"],
             default="tcp",
-            help="Mooncake transport protocol. Used with backend=mooncake.",
+            help=(
+                "Mooncake transport protocol. Use 'ascend' on Huawei Ascend NPUs. "
+                "Used with backend=mooncake."
+            ),
         )
 
     @staticmethod

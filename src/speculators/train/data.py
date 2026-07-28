@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+import threading
 import warnings
 from collections.abc import Callable
 from os import PathLike
@@ -252,6 +253,7 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self._client_lock = threading.Lock()
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -260,10 +262,13 @@ class ArrowDataset(BaseDataset):
         return index + self.start_file_idx
 
     def _setup_client(self):
-        self.client = openai.OpenAI(
+        # Assign self.client only after transfer.setup() succeeds. Otherwise a
+        # failed Mooncake setup leaves client set and every later sample hits
+        # "call setup() first" while skipping re-initialization.
+        client = openai.OpenAI(
             base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
         )
-        list_models = self.client.models.list()
+        list_models = client.models.list()
         model_id = list_models.data[0].id
         if self.model and self.model != model_id:
             raise ValueError(
@@ -271,8 +276,18 @@ class ArrowDataset(BaseDataset):
                 f" found model_id {model_id}."
                 "Please make sure --endpoint is set to the correct vllm instance."
             )
-        self.model = model_id
         self.transfer.setup()
+        self.client = client
+        self.model = model_id
+
+    def _ensure_client(self) -> None:
+        if self.client is not None and self.transfer.is_setup:
+            return
+        with self._client_lock:
+            if self.client is not None and self.transfer.is_setup:
+                return
+            self.client = None
+            self._setup_client()
 
     def __len__(self):
         return len(self.data)
@@ -282,8 +297,16 @@ class ArrowDataset(BaseDataset):
         return list(self.data.with_format(None)["seq_len"])
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
-        if not self.client:
-            self._setup_client()
+        try:
+            self._ensure_client()
+        except Exception as e:
+            warnings.warn(
+                f"Failed to load/cache hidden states for sample {index}: {e}",
+                stacklevel=1,
+            )
+            self.client = None
+            self.transfer.reset()
+            return None
 
         dataset_item = self.data[index]
         client_item = build_client_item(dataset_item)
@@ -308,7 +331,17 @@ class ArrowDataset(BaseDataset):
                 case "cache":
                     self.transfer.cache(handle, file_idx)
                 case "delete":
-                    self.transfer.delete(handle)
+                    # Cleanup failure must be visible, but the hidden states were
+                    # already transferred and validated, so do not discard a
+                    # usable training sample solely because deletion failed.
+                    try:
+                        self.transfer.delete(handle)
+                    except Exception as delete_exc:  # noqa: BLE001
+                        warnings.warn(
+                            f"Failed to delete generated hidden states {handle}: "
+                            f"{delete_exc}",
+                            stacklevel=1,
+                        )
         except Exception as e:
             if isinstance(e, ValueError) and "NaN" in str(e):
                 raise
@@ -316,6 +349,9 @@ class ArrowDataset(BaseDataset):
                 f"Failed to load/cache hidden states for sample {index}: {e}",
                 stacklevel=1,
             )
+            if not self.transfer.is_setup:
+                self.client = None
+                self.transfer.reset()
             return None
 
         return loaded_hs
@@ -466,14 +502,26 @@ class SampleFileDataset(BaseDataset):
         )
 
 
-def create_collate_fn(
-    max_len: int,
-    hidden_size: int,
-    num_target_layers: int = 3,
-    dtype: torch.dtype = torch.bfloat16,
-    preprocess: Callable[[BatchType], BatchType] | None = None,
-):
-    def collate_fn(batch: list[BatchType | None]) -> BatchType:
+class CollateFn:
+    """Picklable collate callable for DataLoader spawn workers."""
+
+    def __init__(
+        self,
+        max_len: int,
+        hidden_size: int,
+        num_target_layers: int = 3,
+        dtype: torch.dtype = torch.bfloat16,
+        preprocess: Callable[[BatchType], BatchType] | None = None,
+    ):
+        self.max_len = max_len
+        self.hidden_size = hidden_size
+        self.num_target_layers = num_target_layers
+        self.dtype = dtype
+        self.preprocess = preprocess
+
+    def __call__(self, batch: list[BatchType | None]) -> BatchType:
+        preprocess = self.preprocess
+        max_len = self.max_len
         # Apply per-sample preprocessing and filter failed samples
         batch = [preprocess(b) if preprocess else b for b in batch if b is not None]
 
@@ -483,7 +531,9 @@ def create_collate_fn(
             # Match the configured `dtype` so the placeholder doesn't crash
             # downstream layers loaded at a different precision (e.g. bf16
             # weights vs fp32 default placeholders).
-            empty = create_empty_sample(hidden_size, num_target_layers, dtype=dtype)
+            empty = create_empty_sample(
+                self.hidden_size, self.num_target_layers, dtype=self.dtype
+            )
             if preprocess:
                 empty = preprocess(empty)
             batch = [empty]
@@ -530,4 +580,18 @@ def create_collate_fn(
 
         return collated_data
 
-    return collate_fn
+
+def create_collate_fn(
+    max_len: int,
+    hidden_size: int,
+    num_target_layers: int = 3,
+    dtype: torch.dtype = torch.bfloat16,
+    preprocess: Callable[[BatchType], BatchType] | None = None,
+):
+    return CollateFn(
+        max_len=max_len,
+        hidden_size=hidden_size,
+        num_target_layers=num_target_layers,
+        dtype=dtype,
+        preprocess=preprocess,
+    )

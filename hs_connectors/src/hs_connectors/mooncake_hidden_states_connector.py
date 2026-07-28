@@ -104,8 +104,18 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._hs_group_idx: int = 0
         self._is_tp_rank_zero: bool = True
         self._store_ready: bool = False
+        writer_threads = (
+            1 if mooncake_cfg.protocol == "ascend" else mooncake_cfg.num_writer_threads
+        )
+        if writer_threads != mooncake_cfg.num_writer_threads:
+            logger.info(
+                "Serializing Mooncake writes for AscendDirectTransport "
+                "(configured=%d, effective=%d)",
+                mooncake_cfg.num_writer_threads,
+                writer_threads,
+            )
         self._executor = ThreadPoolExecutor(
-            max_workers=mooncake_cfg.num_writer_threads,
+            max_workers=writer_threads,
             thread_name_prefix="vllm-mooncake-hs",
         )
         self._req_futures: dict[str, Future] = {}
