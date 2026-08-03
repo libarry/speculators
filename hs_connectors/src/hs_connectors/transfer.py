@@ -15,7 +15,12 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from safetensors.torch import load_file
 
-from hs_connectors.mooncake_store import MooncakeHiddenStatesStore, MooncakeStoreConfig
+from hs_connectors.mooncake_store import (
+    ASCEND_CONSUMER_GLOBAL_SEGMENT_SIZE,
+    ASCEND_CONSUMER_LOCAL_BUFFER_SIZE,
+    MooncakeHiddenStatesStore,
+    MooncakeStoreConfig,
+)
 
 if TYPE_CHECKING:
     import argparse
@@ -251,9 +256,13 @@ class MooncakeBackend(HiddenStatesBackend):
         )
         parser.add_argument(
             "--mooncake-protocol",
-            choices=["tcp", "rdma"],
+            choices=["tcp", "rdma", "ascend"],
             default="tcp",
-            help="Mooncake transport protocol. Used with backend=mooncake.",
+            help=(
+                "Mooncake transport protocol. Used with backend=mooncake. "
+                "On Ascend NPU hosts use 'ascend' (tcp is not usable with "
+                "USE_ASCEND_DIRECT builds)."
+            ),
         )
 
     @staticmethod
@@ -273,14 +282,19 @@ class MooncakeBackend(HiddenStatesBackend):
             "MOONCAKE_LOCAL_HOSTNAME"
         ) or socket.gethostbyname(socket.gethostname())
 
-        store = MooncakeHiddenStatesStore(
-            MooncakeStoreConfig(
-                local_hostname=local_hostname,
-                metadata_server=args.mooncake_metadata_server,
-                master_server_address=args.mooncake_master,
-                protocol=args.mooncake_protocol,
-            )
-        )
+        cfg_kwargs: dict[str, Any] = {
+            "local_hostname": local_hostname,
+            "metadata_server": args.mooncake_metadata_server,
+            "master_server_address": args.mooncake_master,
+            "protocol": args.mooncake_protocol,
+        }
+        # Ascend consumers only pull samples; smaller segments reduce ADXL
+        # registration pressure vs the vLLM producer defaults (4GiB/2GiB).
+        if args.mooncake_protocol == "ascend":
+            cfg_kwargs["global_segment_size"] = ASCEND_CONSUMER_GLOBAL_SEGMENT_SIZE
+            cfg_kwargs["local_buffer_size"] = ASCEND_CONSUMER_LOCAL_BUFFER_SIZE
+
+        store = MooncakeHiddenStatesStore(MooncakeStoreConfig(**cfg_kwargs))
         return MooncakeTransfer(store)
 
     @staticmethod

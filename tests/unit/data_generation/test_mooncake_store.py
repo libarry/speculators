@@ -43,11 +43,20 @@ class _FakeMooncakeStore:
     def batch_remove(self, keys: list[str], force: bool = False) -> list[int]:
         results = []
         for key in keys:
-            removed = key in self._bytes or key in self._tensors
-            self._bytes.pop(key, None)
-            self._tensors.pop(key, None)
-            results.append(0 if removed else -1)
+            results.append(self.remove(key, force=force))
         return results
+
+    def remove(self, key: str, force: bool = False) -> int:  # noqa: ARG002
+        removed = key in self._bytes or key in self._tensors
+        self._bytes.pop(key, None)
+        self._tensors.pop(key, None)
+        return 0 if removed else -1
+
+
+class _FakeMooncakeStoreRemoveOnly(_FakeMooncakeStore):
+    """Mimics Ascend/CANN Mooncake which has remove() but not batch_remove()."""
+
+    batch_remove = None  # type: ignore[assignment]
 
 
 @pytest.fixture
@@ -55,6 +64,13 @@ def store() -> MooncakeHiddenStatesStore:
     s = MooncakeHiddenStatesStore(MooncakeStoreConfig())
     # bypass setup(); no real cluster needed
     s._store = _FakeMooncakeStore()  # type: ignore[assignment]
+    return s
+
+
+@pytest.fixture
+def store_remove_only() -> MooncakeHiddenStatesStore:
+    s = MooncakeHiddenStatesStore(MooncakeStoreConfig())
+    s._store = _FakeMooncakeStoreRemoveOnly()  # type: ignore[assignment]
     return s
 
 
@@ -96,6 +112,44 @@ def test_delete_sample_removes_all_keys(store):
 
 def test_delete_sample_noop_when_missing(store):
     store.delete_sample("nonexistent-key")
+
+
+def test_setup_raises_when_mooncake_returns_nonzero(monkeypatch):
+    class _FailingStore:
+        def setup(self, *args, **kwargs):  # noqa: ARG002
+            return -1
+
+    monkeypatch.setattr(
+        "mooncake.store.MooncakeDistributedStore",
+        _FailingStore,
+        raising=False,
+    )
+    # Patch the import path used inside setup()
+    import sys
+    import types
+
+    fake_mod = types.ModuleType("mooncake.store")
+    fake_mod.MooncakeDistributedStore = _FailingStore  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mooncake.store", fake_mod)
+    monkeypatch.setitem(sys.modules, "mooncake", types.ModuleType("mooncake"))
+
+    s = MooncakeHiddenStatesStore(MooncakeStoreConfig())
+    with pytest.raises(RuntimeError, match="setup failed with rc=-1"):
+        s.setup()
+
+
+def test_delete_sample_falls_back_to_remove(store_remove_only):
+    hs = torch.randn(4, 2, 8, dtype=torch.bfloat16)
+    tids = torch.arange(4, dtype=torch.int64)
+    store_remove_only.put_sample(
+        "req-rm", {"hidden_states": hs, "token_ids": tids}
+    )
+
+    store_remove_only.delete_sample("req-rm")
+
+    assert store_remove_only._store.get("req-rm:meta") == b""
+    assert store_remove_only._store.get_tensor("req-rm:hidden_states") is None
+    assert store_remove_only._store.get_tensor("req-rm:token_ids") is None
 
 
 def test_get_sample_raises_on_evicted_tensor(store):

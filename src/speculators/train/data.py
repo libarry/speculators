@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+import threading
 import warnings
 from collections.abc import Callable, Sequence
 from os import PathLike
@@ -244,6 +245,10 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        # ConcurrentInProcessLoader fetches samples from many threads; guard
+        # one-time OpenAI/Mooncake setup and give each thread its own HTTP client.
+        self._client_lock = threading.Lock()
+        self._thread_local = threading.local()
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -252,19 +257,36 @@ class ArrowDataset(BaseDataset):
         return index + self.start_file_idx
 
     def _setup_client(self):
-        self.client = openai.OpenAI(
-            base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
-        )
-        list_models = self.client.models.list()
-        model_id = list_models.data[0].id
-        if self.model and self.model != model_id:
-            raise ValueError(
-                f"An explicit model name was passed ({self.model}) which doesn't match"
-                f" found model_id {model_id}."
-                "Please make sure --endpoint is set to the correct vllm instance."
+        """Resolve model id and transfer once; safe under concurrent callers."""
+        with self._client_lock:
+            if self.client is not None:
+                return
+            probe = openai.OpenAI(
+                base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
             )
-        self.model = model_id
-        self.transfer.setup()
+            list_models = probe.models.list()
+            model_id = list_models.data[0].id
+            if self.model and self.model != model_id:
+                raise ValueError(
+                    f"An explicit model name was passed ({self.model}) which doesn't "
+                    f"match found model_id {model_id}."
+                    "Please make sure --endpoint is set to the correct vllm instance."
+                )
+            self.model = model_id
+            self.transfer.setup()
+            # Keep a process-level client for non-threaded callers / tests.
+            self.client = probe
+
+    def _http_client(self) -> openai.OpenAI:
+        """Return a per-thread OpenAI client (one HTTP concurrency lane each)."""
+        client = getattr(self._thread_local, "client", None)
+        if client is None:
+            self._setup_client()
+            client = openai.OpenAI(
+                base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
+            )
+            self._thread_local.client = client
+        return client
 
     def __len__(self):
         return len(self.data)
@@ -274,15 +296,14 @@ class ArrowDataset(BaseDataset):
         return list(self.data.with_format(None)["seq_len"])
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
-        if not self.client:
-            self._setup_client()
+        client = self._http_client()
 
         dataset_item = self.data[index]
         client_item = build_client_item(dataset_item)
 
         try:
             handle = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
+                client,
                 self.model,  # type:ignore[arg-type]
                 client_item,
                 timeout=self.request_timeout,

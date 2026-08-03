@@ -228,8 +228,23 @@ class DataArgs(_Group):
         "Model master weights are always kept in fp32. Options: float32, bfloat16 "
         "(recommended). float16 is not supported (requires gradient scaling).",
     )
-    num_workers: int = Field(default=12, description="Number of dataloader workers.")
-    prefetch_factor: int = Field(default=4, description="Dataloader prefetch factor.")
+    num_workers: int = Field(
+        default=12,
+        description=(
+            "Number of dataloader workers. On Ascend Mooncake (protocol=ascend), "
+            "process workers are replaced by an in-process thread pool where each "
+            "worker is one concurrent HTTP + hidden-states get (single shared "
+            "ADXL client)."
+        ),
+    )
+    prefetch_factor: int = Field(
+        default=4,
+        description=(
+            "How many batches to build ahead of the trainer. On Ascend in-process "
+            "mode this is the batch queue depth; sample fetch concurrency is "
+            "controlled by num_workers."
+        ),
+    )
     max_anchors: int = Field(
         default=3072,
         description="Maximum anchor positions for DFlash, DSpark, and P-EAGLE training "
