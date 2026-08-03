@@ -12,7 +12,9 @@ import json
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Train-side consumers only pull sample tensors; huge segments multiply ADXL
 # pressure when many clients are present. Producer (vLLM) keeps the large default.
+# Used only when protocol == "ascend".
 ASCEND_CONSUMER_GLOBAL_SEGMENT_SIZE = 1 * 1024 * 1024 * 1024
 ASCEND_CONSUMER_LOCAL_BUFFER_SIZE = 512 * 1024 * 1024
 
@@ -53,14 +56,21 @@ class MooncakeHiddenStatesStore:
     Each sample is written via ``put_tensor`` under ``{key}:{name}`` plus a
     ``{key}:meta`` JSON marker listing tensor names. ``meta`` is written last,
     so its presence marks the sample complete and ``get_sample`` can poll for it.
+
+    Thread locking is enabled only for ``protocol=ascend`` (in-process threaded
+    prefetch). ``tcp``/``rdma`` keep a picklable no-op lock so DataLoader spawn
+    workers behave as before.
     """
 
     def __init__(self, config: MooncakeStoreConfig):
         self.config = config
         self._store = None
-        # Mooncake/ADXL clients are not documented as multi-thread safe; serialize
-        # store RPCs when in-process prefetch overlaps with other accessors.
-        self._lock = threading.RLock()
+        self._lock: Any
+        if config.protocol == "ascend":
+            # Ascend ADXL clients are not documented as multi-thread safe.
+            self._lock = threading.RLock()
+        else:
+            self._lock = nullcontext()
 
     @property
     def is_setup(self):

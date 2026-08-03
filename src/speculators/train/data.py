@@ -27,6 +27,17 @@ from speculators.train.noise_transforms import TransformTensors
 BatchType = dict[str, Any]
 
 
+def _normalize_model_id(model_id: str) -> str:
+    """Normalize path-like served model ids for equality checks.
+
+    vLLM often serves a local checkpoint path as the model id; callers may pass
+    the same path with or without a trailing slash.
+    """
+    if "/" in model_id or model_id.startswith("."):
+        return str(Path(model_id).expanduser())
+    return model_id.strip()
+
+
 def list_files(path):
     datapath = []
     for root, _directories, files in os.walk(path):
@@ -216,6 +227,8 @@ class ArrowDataset(BaseDataset):
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        *,
+        threaded_fetch: bool = False,
     ):
         self.data = load_from_disk(datapath)
         if not 0.0 < train_ratio <= 1.0:
@@ -245,10 +258,11 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
-        # ConcurrentInProcessLoader fetches samples from many threads; guard
-        # one-time OpenAI/Mooncake setup and give each thread its own HTTP client.
-        self._client_lock = threading.Lock()
-        self._thread_local = threading.local()
+        # Ascend Mooncake only: ConcurrentInProcessLoader uses many threads in one
+        # process. Keep tcp/rdma/file picklable for DataLoader spawn workers.
+        self.threaded_fetch = threaded_fetch
+        self._client_lock = threading.Lock() if threaded_fetch else None
+        self._thread_local = threading.local() if threaded_fetch else None
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -257,28 +271,48 @@ class ArrowDataset(BaseDataset):
         return index + self.start_file_idx
 
     def _setup_client(self):
-        """Resolve model id and transfer once; safe under concurrent callers."""
-        with self._client_lock:
-            if self.client is not None:
-                return
-            probe = openai.OpenAI(
-                base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
+        """Resolve model id and transfer once.
+
+        When ``threaded_fetch`` is enabled (Ascend in-process loader), this is
+        guarded by a lock; otherwise it matches the original single-client path
+        used by multiproc DataLoader workers.
+        """
+        if self.threaded_fetch:
+            assert self._client_lock is not None
+            with self._client_lock:
+                self._setup_client_unlocked()
+            return
+        self._setup_client_unlocked()
+
+    def _setup_client_unlocked(self) -> None:
+        if self.client is not None:
+            return
+        client = openai.OpenAI(
+            base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
+        )
+        list_models = client.models.list()
+        model_id = list_models.data[0].id
+        if self.model and _normalize_model_id(self.model) != _normalize_model_id(
+            model_id
+        ):
+            raise ValueError(
+                f"An explicit model name was passed ({self.model}) which doesn't "
+                f"match found model_id {model_id}."
+                "Please make sure --endpoint is set to the correct vllm instance."
             )
-            list_models = probe.models.list()
-            model_id = list_models.data[0].id
-            if self.model and self.model != model_id:
-                raise ValueError(
-                    f"An explicit model name was passed ({self.model}) which doesn't "
-                    f"match found model_id {model_id}."
-                    "Please make sure --endpoint is set to the correct vllm instance."
-                )
-            self.model = model_id
-            self.transfer.setup()
-            # Keep a process-level client for non-threaded callers / tests.
-            self.client = probe
+        self.model = model_id
+        self.transfer.setup()
+        self.client = client
 
     def _http_client(self) -> openai.OpenAI:
-        """Return a per-thread OpenAI client (one HTTP concurrency lane each)."""
+        """Per-thread OpenAI client for Ascend threaded_fetch; else shared client."""
+        if not self.threaded_fetch:
+            if not self.client:
+                self._setup_client()
+            assert self.client is not None
+            return self.client
+
+        assert self._thread_local is not None
         client = getattr(self._thread_local, "client", None)
         if client is None:
             self._setup_client()

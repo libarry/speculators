@@ -231,18 +231,16 @@ class DataArgs(_Group):
     num_workers: int = Field(
         default=12,
         description=(
-            "Number of dataloader workers. On Ascend Mooncake (protocol=ascend), "
-            "process workers are replaced by an in-process thread pool where each "
-            "worker is one concurrent HTTP + hidden-states get (single shared "
-            "ADXL client)."
+            "Number of dataloader workers. Only when Mooncake protocol=ascend: "
+            "replaced by an in-process thread pool (each worker = one concurrent "
+            "HTTP + HS get, shared ADXL client). tcp/rdma keep multiproc workers."
         ),
     )
     prefetch_factor: int = Field(
         default=4,
         description=(
-            "How many batches to build ahead of the trainer. On Ascend in-process "
-            "mode this is the batch queue depth; sample fetch concurrency is "
-            "controlled by num_workers."
+            "Dataloader prefetch factor. For protocol=ascend in-process mode this "
+            "is batch queue depth; for tcp/rdma it is the usual PyTorch meaning."
         ),
     )
     max_anchors: int = Field(

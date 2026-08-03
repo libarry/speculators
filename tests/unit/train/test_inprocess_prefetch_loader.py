@@ -154,10 +154,15 @@ def test_use_inprocess_prefetch_env_and_ascend_protocol(monkeypatch):
     monkeypatch.delenv("SPECULATORS_INPROCESS_PREFETCH", raising=False)
     assert _use_inprocess_prefetch(_Transfer()) is True
 
+    # Non-ascend protocols never use in-process mode (even with env=1).
     _Cfg.protocol = "tcp"
-    assert _use_inprocess_prefetch(_Transfer()) is False
-
     monkeypatch.setenv("SPECULATORS_INPROCESS_PREFETCH", "1")
-    assert _use_inprocess_prefetch(None) is True
+    assert _use_inprocess_prefetch(_Transfer()) is False
+    _Cfg.protocol = "rdma"
+    assert _use_inprocess_prefetch(_Transfer()) is False
+    assert _use_inprocess_prefetch(None) is False
+
+    # Ascend can be force-disabled.
+    _Cfg.protocol = "ascend"
     monkeypatch.setenv("SPECULATORS_INPROCESS_PREFETCH", "0")
     assert _use_inprocess_prefetch(_Transfer()) is False

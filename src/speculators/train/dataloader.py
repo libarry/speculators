@@ -215,15 +215,20 @@ class InProcessPrefetchLoader(ConcurrentInProcessLoader):
 
 
 def _use_inprocess_prefetch(transfer: HiddenStatesTransfer | None) -> bool:
-    """Prefer in-process concurrent fetch for Ascend Mooncake unless overridden."""
-    flag = os.environ.get("SPECULATORS_INPROCESS_PREFETCH", "").strip().lower()
-    if flag in {"1", "true", "yes", "on"}:
-        return True
-    if flag in {"0", "false", "no", "off"}:
-        return False
+    """Enable Ascend-only in-process concurrent fetch.
+
+    Only ``protocol=ascend`` uses ConcurrentInProcessLoader + threaded HTTP.
+    ``tcp``/``rdma`` keep the original multiproc DataLoader path. Set
+    ``SPECULATORS_INPROCESS_PREFETCH=0`` to force-disable even for ascend.
+    """
     store = getattr(transfer, "store", None)
     protocol = getattr(getattr(store, "config", None), "protocol", None)
-    return protocol == "ascend"
+    if protocol != "ascend":
+        return False
+    flag = os.environ.get("SPECULATORS_INPROCESS_PREFETCH", "").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    return True
 
 
 def _limit_worker_threads() -> None:
@@ -350,7 +355,8 @@ def create_train_val_loaders(
     When ``transfer`` is Ascend Mooncake (``protocol=ascend``), process workers
     are replaced by :class:`ConcurrentInProcessLoader`: ``num_workers`` threads
     each run one concurrent HTTP + HS-get, sharing a single ADXL client.
-    Override with ``SPECULATORS_INPROCESS_PREFETCH=0/1``.
+    ``tcp``/``rdma`` keep the original multiproc DataLoader path unchanged.
+    Set ``SPECULATORS_INPROCESS_PREFETCH=0`` to disable Ascend in-process mode.
     """
     _limit_worker_threads()
     inprocess_prefetch = _use_inprocess_prefetch(transfer)
@@ -395,6 +401,7 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
+            threaded_fetch=inprocess_prefetch,
         )
         val_dataset = ArrowDataset(
             datapath=data_path,
@@ -409,6 +416,7 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
+            threaded_fetch=inprocess_prefetch,
         )
 
     train_loader = _setup_dataloader(
