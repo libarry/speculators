@@ -264,6 +264,17 @@ class MooncakeBackend(HiddenStatesBackend):
                 "USE_ASCEND_DIRECT builds)."
             ),
         )
+        parser.add_argument(
+            "--mooncake-hs-chunk-bytes",
+            type=int,
+            default=0,
+            help=(
+                "Soft max bytes per Mooncake put/get when transferring large "
+                "hidden_states (split roughly along seq dim). 0 disables "
+                "chunking. Producer and consumer should use the same value. "
+                "Used with backend=mooncake."
+            ),
+        )
 
     @staticmethod
     def add_train_args(parser: argparse.ArgumentParser) -> None:
@@ -287,6 +298,7 @@ class MooncakeBackend(HiddenStatesBackend):
             "metadata_server": args.mooncake_metadata_server,
             "master_server_address": args.mooncake_master,
             "protocol": args.mooncake_protocol,
+            "hs_chunk_bytes": int(getattr(args, "mooncake_hs_chunk_bytes", 0) or 0),
         }
         # Ascend consumers only pull samples; smaller segments reduce ADXL
         # registration pressure vs the vLLM producer defaults (4GiB/2GiB).
@@ -308,6 +320,7 @@ class MooncakeBackend(HiddenStatesBackend):
             metadata_server=args.mooncake_metadata_server,
             master_server_address=args.mooncake_master,
             protocol=args.mooncake_protocol,
+            hs_chunk_bytes=int(getattr(args, "mooncake_hs_chunk_bytes", 0) or 0),
         )
 
         return {

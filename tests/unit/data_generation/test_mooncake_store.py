@@ -6,6 +6,8 @@ The point is to prove the seam: a tensor dict written by the producer is read
 back byte-identical by the consumer.
 """
 
+import json
+
 import pytest
 import torch
 
@@ -162,3 +164,59 @@ def test_get_sample_raises_on_evicted_tensor(store):
 
     with pytest.raises(RuntimeError, match="evicted"):
         store.get_sample("req-evict", timeout=1.0)
+
+
+def test_chunked_put_get_roundtrip():
+    # Force multiple chunks along seq dim: 16 rows * 2 * 8 * 2 bytes = 512 B
+    # with max_bytes=200 -> ~6 rows/chunk.
+    s = MooncakeHiddenStatesStore(MooncakeStoreConfig(hs_chunk_bytes=200))
+    s._store = _FakeMooncakeStore()  # type: ignore[assignment]
+
+    hidden_states = torch.randn(16, 2, 8, dtype=torch.bfloat16)
+    token_ids = torch.arange(16, dtype=torch.int64)
+    s.put_sample("req-chunk", {"hidden_states": hidden_states, "token_ids": token_ids})
+
+    # Meta must be v2 because hidden_states was split.
+    meta = json.loads(s._store.get("req-chunk:meta"))
+    assert isinstance(meta, dict)
+    assert meta["v"] == 2
+    hs_entry = next(e for e in meta["tensors"] if e["name"] == "hidden_states")
+    assert hs_entry["n_chunks"] > 1
+    # token_ids is tiny → single unchunked key
+    assert "req-chunk:token_ids" in s._store._tensors
+    assert "req-chunk:hidden_states:0" in s._store._tensors
+
+    out = s.get_sample("req-chunk", timeout=1.0)
+    assert out["hidden_states"].shape == hidden_states.shape
+    assert torch.equal(out["hidden_states"], hidden_states)
+    assert torch.equal(out["token_ids"], token_ids)
+
+
+def test_chunked_delete_removes_part_keys():
+    s = MooncakeHiddenStatesStore(MooncakeStoreConfig(hs_chunk_bytes=200))
+    s._store = _FakeMooncakeStore()  # type: ignore[assignment]
+    hs = torch.randn(16, 2, 8, dtype=torch.bfloat16)
+    tids = torch.arange(16, dtype=torch.int64)
+    s.put_sample("req-cdel", {"hidden_states": hs, "token_ids": tids})
+    part_keys = [k for k in s._store._tensors if k.startswith("req-cdel:hidden_states")]
+    assert len(part_keys) > 1
+
+    s.delete_sample("req-cdel")
+    assert s._store.get("req-cdel:meta") == b""
+    for k in part_keys:
+        assert s._store.get_tensor(k) is None
+
+
+def test_legacy_meta_still_readable(store):
+    # Old producers wrote a bare name list + single-key tensors.
+    hs = torch.randn(3, 2, 4, dtype=torch.bfloat16)
+    tids = torch.arange(3, dtype=torch.int64)
+    store._store.put_tensor("req-legacy:hidden_states", hs)
+    store._store.put_tensor("req-legacy:token_ids", tids)
+    store._store.put(
+        "req-legacy:meta", json.dumps(["hidden_states", "token_ids"]).encode()
+    )
+
+    out = store.get_sample("req-legacy", timeout=1.0)
+    assert torch.equal(out["hidden_states"], hs)
+    assert torch.equal(out["token_ids"], tids)
