@@ -34,8 +34,8 @@ class MooncakeStoreConfig:
     local_hostname: str = "localhost"
     metadata_server: str = "P2PHANDSHAKE"
     master_server_address: str = "127.0.0.1:50051"
-    global_segment_size: int = 4 * 1024 * 1024 * 1024
-    local_buffer_size: int = 2 * 1024 * 1024 * 1024
+    global_segment_size: int = 16 * 1024 * 1024 * 1024
+    local_buffer_size: int = 8 * 1024 * 1024 * 1024
     protocol: str = "tcp"
     device_name: str = ""
     num_writer_threads: int = 16
