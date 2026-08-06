@@ -275,6 +275,24 @@ class MooncakeBackend(HiddenStatesBackend):
                 "Used with backend=mooncake."
             ),
         )
+        parser.add_argument(
+            "--mooncake-hs-transfer-max-retries",
+            type=int,
+            default=3,
+            help=(
+                "Retries after the first failed Mooncake hidden-state chunk "
+                "put/get. Default: 3."
+            ),
+        )
+        parser.add_argument(
+            "--mooncake-hs-transfer-retry-backoff",
+            type=float,
+            default=1.0,
+            help=(
+                "Initial retry backoff in seconds; subsequent waits use "
+                "exponential backoff. Default: 1.0."
+            ),
+        )
 
     @staticmethod
     def add_train_args(parser: argparse.ArgumentParser) -> None:
@@ -299,6 +317,12 @@ class MooncakeBackend(HiddenStatesBackend):
             "master_server_address": args.mooncake_master,
             "protocol": args.mooncake_protocol,
             "hs_chunk_bytes": int(getattr(args, "mooncake_hs_chunk_bytes", 0) or 0),
+            "hs_transfer_max_retries": int(
+                getattr(args, "mooncake_hs_transfer_max_retries", 3)
+            ),
+            "hs_transfer_retry_backoff": float(
+                getattr(args, "mooncake_hs_transfer_retry_backoff", 1.0)
+            ),
         }
         # Ascend consumers only pull samples; smaller segments reduce ADXL
         # registration pressure vs the vLLM producer defaults (4GiB/2GiB).
@@ -321,6 +345,12 @@ class MooncakeBackend(HiddenStatesBackend):
             master_server_address=args.mooncake_master,
             protocol=args.mooncake_protocol,
             hs_chunk_bytes=int(getattr(args, "mooncake_hs_chunk_bytes", 0) or 0),
+            hs_transfer_max_retries=int(
+                getattr(args, "mooncake_hs_transfer_max_retries", 3)
+            ),
+            hs_transfer_retry_backoff=float(
+                getattr(args, "mooncake_hs_transfer_retry_backoff", 1.0)
+            ),
         )
 
         return {

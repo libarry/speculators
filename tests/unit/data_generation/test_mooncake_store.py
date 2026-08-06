@@ -42,6 +42,9 @@ class _FakeMooncakeStore:
         t = self._tensors.get(key)
         return t.clone() if t is not None else None
 
+    def is_exist(self, key: str) -> bool:
+        return key in self._bytes or key in self._tensors
+
     def batch_remove(self, keys: list[str], force: bool = False) -> list[int]:
         results = []
         for key in keys:
@@ -154,7 +157,7 @@ def test_delete_sample_falls_back_to_remove(store_remove_only):
     assert store_remove_only._store.get_tensor("req-rm:token_ids") is None
 
 
-def test_get_sample_raises_on_evicted_tensor(store):
+def test_get_sample_reports_missing_tensor(store):
     hs = torch.randn(4, 2, 8, dtype=torch.bfloat16)
     tids = torch.arange(4, dtype=torch.int64)
     store.put_sample("req-evict", {"hidden_states": hs, "token_ids": tids})
@@ -162,7 +165,7 @@ def test_get_sample_raises_on_evicted_tensor(store):
     # Simulate eviction: meta key survives but tensor data is gone
     del store._store._tensors["req-evict:hidden_states"]
 
-    with pytest.raises(RuntimeError, match="evicted"):
+    with pytest.raises(RuntimeError, match="key missing/evicted"):
         store.get_sample("req-evict", timeout=1.0)
 
 
@@ -220,3 +223,70 @@ def test_legacy_meta_still_readable(store):
     out = store.get_sample("req-legacy", timeout=1.0)
     assert torch.equal(out["hidden_states"], hs)
     assert torch.equal(out["token_ids"], tids)
+
+
+def test_get_tensor_retries_transient_transfer_failure():
+    class _FailOnceStore(_FakeMooncakeStore):
+        def __init__(self):
+            super().__init__()
+            self.get_attempts: dict[str, int] = {}
+
+        def get_tensor(self, key: str) -> torch.Tensor | None:
+            self.get_attempts[key] = self.get_attempts.get(key, 0) + 1
+            if self.get_attempts[key] == 1:
+                return None
+            return super().get_tensor(key)
+
+    s = MooncakeHiddenStatesStore(
+        MooncakeStoreConfig(
+            hs_transfer_max_retries=2,
+            hs_transfer_retry_backoff=0,
+        )
+    )
+    s._store = _FailOnceStore()  # type: ignore[assignment]
+    hs = torch.randn(4, 2, 8, dtype=torch.bfloat16)
+    tids = torch.arange(4, dtype=torch.int64)
+    s.put_sample("req-retry", {"hidden_states": hs, "token_ids": tids})
+
+    out = s.get_sample("req-retry", timeout=1.0)
+
+    assert torch.equal(out["hidden_states"], hs)
+    assert s._store.get_attempts["req-retry:hidden_states"] == 2
+
+
+def test_put_failure_cleans_partial_keys_and_publishes_error():
+    class _FailSecondChunkStore(_FakeMooncakeStore):
+        def put_tensor(self, key: str, tensor: torch.Tensor) -> int:
+            if key.endswith("hidden_states:1"):
+                return -800
+            return super().put_tensor(key, tensor)
+
+    s = MooncakeHiddenStatesStore(
+        MooncakeStoreConfig(
+            hs_chunk_bytes=200,
+            hs_transfer_max_retries=1,
+            hs_transfer_retry_backoff=0,
+        )
+    )
+    s._store = _FailSecondChunkStore()  # type: ignore[assignment]
+    hs = torch.randn(16, 2, 8, dtype=torch.bfloat16)
+    tids = torch.arange(16, dtype=torch.int64)
+
+    with pytest.raises(RuntimeError, match="put_tensor failed"):
+        s.put_sample("req-put-fail", {"hidden_states": hs, "token_ids": tids})
+
+    assert s._store.get("req-put-fail:meta") == b""
+    assert s._store.get("req-put-fail:error")
+    assert not any(k.startswith("req-put-fail:") for k in s._store._tensors)
+
+
+def test_consumer_reports_producer_error_without_meta_timeout():
+    s = MooncakeHiddenStatesStore(MooncakeStoreConfig())
+    s._store = _FakeMooncakeStore()  # type: ignore[assignment]
+    s._store.put(
+        "req-producer-error:error",
+        json.dumps({"error": "put chunk 1 rc=-800"}).encode(),
+    )
+
+    with pytest.raises(RuntimeError, match="producer failed.*rc=-800"):
+        s.get_sample("req-producer-error", timeout=1.0)
