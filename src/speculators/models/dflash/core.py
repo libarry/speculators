@@ -1,3 +1,4 @@
+import copy
 import logging
 from typing import ClassVar
 
@@ -12,8 +13,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.attention import create_float_mask
-from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.attention import create_anchor_block_mask_mod
+from speculators.models.dflash.config import DFlashSpeculatorConfig
 from speculators.models.dflash.metrics import compute_metrics
 from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
 from speculators.models.dflash.utils import (
@@ -28,6 +29,127 @@ logger = logging.getLogger(__name__)
 # Compile so the mask builds block-sparse instead of materializing DFlash's huge
 # dense [Q, KV] grid every step. (No benefit for EAGLE3's small autoregressive mask.)
 _compiled_create_block_mask = torch.compile(create_block_mask)
+
+_MLA_DIM_DEFAULTS: dict[str, int] = {
+    "q_lora_rank": 1536,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+}
+
+_MLA_SYNC_ATTRS = (
+    "attention_type",
+    "q_lora_rank",
+    "kv_lora_rank",
+    "qk_nope_head_dim",
+    "qk_rope_head_dim",
+    "v_head_dim",
+    "mla_use_output_gate",
+)
+
+
+def _first_attr(sources: list[object], name: str) -> object | None:
+    for source in sources:
+        if source is None:
+            continue
+        value = getattr(source, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def resolve_mla_config_kwargs(
+    *,
+    attention_type: str,
+    verifier_config: PretrainedConfig,
+    verifier_name_or_path: str | None = None,
+    q_lora_rank: int | None = None,
+    kv_lora_rank: int | None = None,
+    qk_nope_head_dim: int | None = None,
+    qk_rope_head_dim: int | None = None,
+    v_head_dim: int | None = None,
+    mla_use_output_gate: bool = False,
+) -> dict:
+    """Resolve attention_type and MLA dims for DFlashSpeculatorConfig."""
+    if attention_type != "mla":
+        return {
+            "attention_type": "gqa",
+            "q_lora_rank": None,
+            "kv_lora_rank": None,
+            "qk_nope_head_dim": None,
+            "qk_rope_head_dim": None,
+            "v_head_dim": None,
+            "mla_use_output_gate": False,
+        }
+
+    sources: list[object] = [verifier_config]
+    text_config = getattr(verifier_config, "text_config", None)
+    if text_config is not None:
+        sources.append(text_config)
+
+    need_remote = any(
+        explicit is None
+        and _first_attr(sources, name) is None
+        for name, explicit in (
+            ("q_lora_rank", q_lora_rank),
+            ("kv_lora_rank", kv_lora_rank),
+            ("qk_nope_head_dim", qk_nope_head_dim),
+            ("qk_rope_head_dim", qk_rope_head_dim),
+            ("v_head_dim", v_head_dim),
+        )
+    )
+    if need_remote and verifier_name_or_path:
+        from transformers import AutoConfig  # noqa: PLC0415
+
+        remote = AutoConfig.from_pretrained(verifier_name_or_path)
+        sources.append(remote)
+        remote_text = getattr(remote, "text_config", None)
+        if remote_text is not None:
+            sources.append(remote_text)
+
+    def resolve_dim(name: str, explicit: int | None) -> int:
+        if explicit is not None:
+            return int(explicit)
+        inherited = _first_attr(sources, name)
+        if inherited is not None:
+            return int(inherited)  # type: ignore[arg-type]
+        return _MLA_DIM_DEFAULTS[name]
+
+    return {
+        "attention_type": "mla",
+        "q_lora_rank": resolve_dim("q_lora_rank", q_lora_rank),
+        "kv_lora_rank": resolve_dim("kv_lora_rank", kv_lora_rank),
+        "qk_nope_head_dim": resolve_dim("qk_nope_head_dim", qk_nope_head_dim),
+        "qk_rope_head_dim": resolve_dim("qk_rope_head_dim", qk_rope_head_dim),
+        "v_head_dim": resolve_dim("v_head_dim", v_head_dim),
+        "mla_use_output_gate": bool(mla_use_output_gate),
+    }
+
+
+def sync_attention_attrs_to_layer_config(
+    speculator_config: DFlashSpeculatorConfig,
+) -> None:
+    """Copy attention_type / MLA dims onto transformer_layer_config for layers."""
+    if speculator_config.attention_type == "mla":
+        missing = [
+            name
+            for name in (
+                "kv_lora_rank",
+                "qk_nope_head_dim",
+                "qk_rope_head_dim",
+                "v_head_dim",
+            )
+            if getattr(speculator_config, name) is None
+        ]
+        if missing:
+            raise ValueError(
+                "attention_type='mla' requires MLA dims to be set; missing: "
+                + ", ".join(missing)
+            )
+    tl_config = speculator_config.transformer_layer_config
+    for name in _MLA_SYNC_ATTRS:
+        setattr(tl_config, name, getattr(speculator_config, name))
 
 
 @SpeculatorModel.register("dflash")
@@ -68,6 +190,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             if self._attn_impl == "eager"
             else create_mask
         )
+        sync_attention_attrs_to_layer_config(config)
         super().__init__(config=config)
         self._init_vocab(config)
 
@@ -95,7 +218,22 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
-        self.rotary_emb = Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
+        # MLA layers apply interleaved RoPE themselves (including YaRN). The shared
+        # embedding only satisfies the GQA-shaped forward signature and is ignored
+        # by MLA attention, so strip YaRN here to avoid HF rope init failures.
+        rotary_config = config.transformer_layer_config
+        if config.attention_type == "mla":
+            rotary_config = copy.deepcopy(rotary_config)
+            rope_theta = getattr(rotary_config, "rope_theta", 10000.0) or 10000.0
+            plain_rope = {"rope_type": "default", "rope_theta": float(rope_theta)}
+            for attr in ("rope_scaling", "rope_parameters"):
+                params = getattr(rotary_config, attr, None)
+                if not isinstance(params, dict):
+                    continue
+                scaling_type = params.get("rope_type", params.get("type"))
+                if scaling_type == "yarn":
+                    setattr(rotary_config, attr, plain_rope)
+        self.rotary_emb = Qwen3RotaryEmbedding(rotary_config)  # type: ignore[arg-type]
 
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,
@@ -204,6 +342,18 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         # True: sample from anchor too (block_size tokens)
         speculative_tokens = block_size if sample_from_anchor else block_size - 1
 
+        mla_kwargs = resolve_mla_config_kwargs(
+            attention_type=kwargs.get("attention_type", "gqa"),
+            verifier_config=verifier_config,
+            verifier_name_or_path=kwargs.get("verifier_name_or_path"),
+            q_lora_rank=kwargs.get("q_lora_rank"),
+            kv_lora_rank=kwargs.get("kv_lora_rank"),
+            qk_nope_head_dim=kwargs.get("qk_nope_head_dim"),
+            qk_rope_head_dim=kwargs.get("qk_rope_head_dim"),
+            v_head_dim=kwargs.get("v_head_dim"),
+            mla_use_output_gate=kwargs.get("mla_use_output_gate", False),
+        )
+
         return {
             "transformer_layer_config": verifier_config,
             "draft_vocab_size": kwargs["draft_vocab_size"],
@@ -212,6 +362,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
             "sample_from_anchor": sample_from_anchor,
+            **mla_kwargs,
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
                 proposal_methods=[

@@ -454,6 +454,32 @@ class DFlashArgs(_Group):
         description="Smoothing constant for the D-PACE loss (default: 0.5). Must be in "
         "(0, 1] when --per-position-loss-weight=dpace.",
     )
+    attention_type: Literal["gqa", "mla"] = Field(
+        default="gqa",
+        description="Draft attention type for DFlash/DSpark: 'gqa' (default) or "
+        "'mla' (DeepSeek multi-head latent attention).",
+    )
+    q_lora_rank: int | None = Field(
+        default=None,
+        description="MLA: Q LoRA rank (None = inherit from verifier or default 1536; "
+        "set explicitly to disable Q LoRA only via draft config, not CLI).",
+    )
+    kv_lora_rank: int | None = Field(
+        default=None,
+        description="MLA: KV LoRA rank (inherit from verifier or default 512).",
+    )
+    qk_nope_head_dim: int | None = Field(
+        default=None,
+        description="MLA: non-RoPE Q/K head dim (inherit or default 128).",
+    )
+    qk_rope_head_dim: int | None = Field(
+        default=None,
+        description="MLA: RoPE Q/K head dim (inherit or default 64).",
+    )
+    v_head_dim: int | None = Field(
+        default=None,
+        description="MLA: value head dim (inherit or default 128).",
+    )
 
 
 class DSparkArgs(_Group):

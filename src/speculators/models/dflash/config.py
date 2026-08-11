@@ -81,6 +81,57 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
+    attention_type: Literal["gqa", "mla"] = Field(
+        default="gqa",
+        description=(
+            "Draft attention mechanism: 'gqa' (default Qwen3-style GQA) or "
+            "'mla' (DeepSeek multi-head latent attention with dual-source KV)."
+        ),
+    )
+
+    q_lora_rank: int | None = Field(
+        default=None,
+        description=(
+            "MLA only: Q LoRA rank. None disables Q compression (direct q_proj). "
+            "When attention_type=mla and unset, inherited from the verifier or "
+            "defaults to 1536."
+        ),
+    )
+    kv_lora_rank: int | None = Field(
+        default=None,
+        description=(
+            "MLA only: KV LoRA / compressed latent rank. When attention_type=mla "
+            "and unset, inherited from the verifier or defaults to 512."
+        ),
+    )
+    qk_nope_head_dim: int | None = Field(
+        default=None,
+        description=(
+            "MLA only: non-RoPE Q/K head dim. When attention_type=mla and unset, "
+            "inherited from the verifier or defaults to 128."
+        ),
+    )
+    qk_rope_head_dim: int | None = Field(
+        default=None,
+        description=(
+            "MLA only: RoPE Q/K head dim. When attention_type=mla and unset, "
+            "inherited from the verifier or defaults to 64."
+        ),
+    )
+    v_head_dim: int | None = Field(
+        default=None,
+        description=(
+            "MLA only: value head dim. When attention_type=mla and unset, "
+            "inherited from the verifier or defaults to 128."
+        ),
+    )
+    mla_use_output_gate: bool = Field(
+        default=False,
+        description=(
+            "MLA only: output gate (not implemented; must remain False)."
+        ),
+    )
+
     @field_serializer("transformer_layer_config")
     def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
         """Serialize transformer config to dict."""

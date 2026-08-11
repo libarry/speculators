@@ -14,6 +14,12 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Unpack
 
+from speculators.models.dflash.mla_rope import (
+    apply_rope_interleaved,
+    build_mla_rotary_embedding,
+    compute_mla_softmax_scale,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -155,11 +161,203 @@ class Qwen3DFlashAttention(nn.Module):
         return attn_output, attn_weights
 
 
+class Qwen3DFlashMLAAttention(nn.Module):
+    """DeepSeek MLA attention with DFlash dual-source KV injection.
+
+    Q is projected from draft hidden states only. K/V are projected from
+    ``cat(target_hidden, draft_hidden)`` with shared MLA weights. RoPE is
+    interleaved and applied only on ``qk_rope_head_dim``.
+    """
+
+    def __init__(self, config: Qwen3Config, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = False
+
+        self.q_lora_rank = getattr(config, "q_lora_rank", None)
+        self.kv_lora_rank = int(getattr(config, "kv_lora_rank"))
+        self.qk_nope_head_dim = int(getattr(config, "qk_nope_head_dim"))
+        self.qk_rope_head_dim = int(getattr(config, "qk_rope_head_dim"))
+        self.v_head_dim = int(getattr(config, "v_head_dim"))
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # After expanding the shared k_rope head, Q/K/V are dense MHA.
+        self.num_key_value_groups = 1
+        self.head_dim = self.qk_head_dim
+
+        if getattr(config, "mla_use_output_gate", False):
+            raise NotImplementedError(
+                "mla_use_output_gate=True is not supported; published MLA DSpark "
+                "checkpoints carry no gate weights."
+            )
+
+        # Large max_position_embeddings (e.g. 1M-token Kimi) would prebuild huge
+        # cos/sin caches; start smaller and grow on demand.
+        self.max_position_embeddings = min(
+            int(getattr(config, "max_position_embeddings", 32768)), 32768
+        )
+
+        if self.q_lora_rank is not None:
+            self.q_a_proj = nn.Linear(
+                self.hidden_size,  # type: ignore[arg-type]
+                self.q_lora_rank,
+                bias=False,
+            )
+            self.q_a_layernorm = Qwen3RMSNorm(
+                self.q_lora_rank,
+                eps=config.rms_norm_eps,  # type: ignore[arg-type]
+            )
+            self.q_b_proj = nn.Linear(
+                self.q_lora_rank,
+                self.num_heads * self.qk_head_dim,  # type: ignore[operator]
+                bias=False,
+            )
+        else:
+            self.q_proj = nn.Linear(
+                self.hidden_size,  # type: ignore[arg-type]
+                self.num_heads * self.qk_head_dim,  # type: ignore[operator]
+                bias=False,
+            )
+
+        self.kv_a_proj_with_mqa = nn.Linear(
+            self.hidden_size,  # type: ignore[arg-type]
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+        )
+        self.kv_a_layernorm = Qwen3RMSNorm(
+            self.kv_lora_rank,
+            eps=config.rms_norm_eps,  # type: ignore[arg-type]
+        )
+        self.kv_b_proj = nn.Linear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),  # type: ignore[operator]
+            bias=False,
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.v_head_dim,  # type: ignore[operator]
+            self.hidden_size,  # type: ignore[arg-type]
+            bias=False,
+        )
+
+        self.rotary_emb = build_mla_rotary_embedding(
+            config, self.qk_rope_head_dim, self.max_position_embeddings
+        )
+        self.scaling = compute_mla_softmax_scale(config, self.qk_head_dim)
+        self.sliding_window = (
+            config.sliding_window
+            if hasattr(config, "layer_types")
+            and config.layer_types is not None
+            and config.layer_types[layer_idx] == "sliding_attention"  # type: ignore[index]
+            else None
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        target_hidden: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],  # noqa: ARG002
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if position_ids is None:
+            raise ValueError(
+                "Qwen3DFlashMLAAttention requires position_ids for interleaved RoPE."
+            )
+
+        bsz, draft_len, _ = hidden_states.shape
+        ctx_len = target_hidden.shape[1]
+        total_len = ctx_len + draft_len
+
+        if self.q_lora_rank is not None:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        else:
+            q = self.q_proj(hidden_states)
+        q = q.view(bsz, draft_len, self.num_heads, self.qk_head_dim).transpose(1, 2)
+        q_nope, q_rope = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+
+        kv_input = torch.cat([target_hidden, hidden_states], dim=1)
+        kv_combined = self.kv_a_proj_with_mqa(kv_input)
+        kv_compressed, k_rope = torch.split(
+            kv_combined, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        kv = self.kv_b_proj(self.kv_a_layernorm(kv_compressed))
+        kv = kv.view(
+            bsz, total_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        k_nope, value = torch.split(
+            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+        k_nope = k_nope.transpose(1, 2)
+        value = value.transpose(1, 2)
+        k_rope = k_rope.unsqueeze(1)
+
+        draft_position_ids = position_ids[:, ctx_len:]
+        full_position_ids = position_ids
+        cos, sin = self.rotary_emb(q_rope, seq_len=int(full_position_ids.max()) + 1)
+        cos = cos.to(hidden_states.device)
+        sin = sin.to(hidden_states.device)
+        q_rope = apply_rope_interleaved(q_rope, cos, sin, draft_position_ids)
+        k_rope = apply_rope_interleaved(k_rope, cos, sin, full_position_ids)
+
+        query_states = torch.cat([q_nope, q_rope], dim=-1)
+        key_states = torch.cat(
+            [k_nope, k_rope.expand(-1, self.num_heads, -1, -1)], dim=-1
+        )
+
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value = past_key_values.update(
+                key_states, value, self.layer_idx, cache_kwargs
+            )
+
+        attn_fn: Callable = eager_attention_forward
+        if (
+            self.config._attn_implementation is not None  # noqa: SLF001
+            and self.config._attn_implementation != "eager"  # noqa: SLF001
+        ):
+            attn_fn = ALL_ATTENTION_FUNCTIONS[
+                self.config._attn_implementation  # noqa: SLF001
+            ]
+        attn_output, attn_weights = attn_fn(
+            self,
+            query_states,
+            key_states,
+            value,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **kwargs,
+        )
+        attn_output = attn_output.reshape(bsz, draft_len, -1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
 class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
+        attention_type = getattr(config, "attention_type", "gqa")
+        if attention_type == "mla":
+            self.self_attn = Qwen3DFlashMLAAttention(
+                config=config, layer_idx=layer_idx
+            )
+        elif attention_type == "gqa":
+            self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
+        else:
+            raise ValueError(
+                f"Unsupported attention_type={attention_type!r}; "
+                "expected 'gqa' or 'mla'."
+            )
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # type: ignore[arg-type]
         self.post_attention_layernorm = Qwen3RMSNorm(
