@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tqdm import tqdm
 
 ATTN_RE = re.compile(r"^layers\.(\d+)\.self_attn\.")
 
@@ -273,7 +274,7 @@ def main() -> None:
     out_w: dict[str, torch.Tensor] = {
         k: v for k, v in weights.items() if not ATTN_RE.match(k)
     }
-    for i in range(num_layers):
+    for i in tqdm(range(num_layers), desc="Converting layers", unit="layer"):
         pref = f"layers.{i}.self_attn."
         converted = convert_layer(
             weights[pref + "q_proj.weight"],
@@ -294,11 +295,11 @@ def main() -> None:
         )
         for name, tensor in converted.items():
             out_w[pref + name] = tensor
-        print(f"  converted layer {i}")
 
     dst = args.output_path
     dst.mkdir(parents=True, exist_ok=True)
     (dst / "config.json").write_text(json.dumps(out_cfg, indent=2) + "\n")
+    print("Saving model.safetensors ...")
     save_file({k: t.contiguous() for k, t in out_w.items()}, str(dst / "model.safetensors"))
     print(f"Wrote {dst}")
 
