@@ -2,15 +2,17 @@
 """Convert a Speculators GQA DSpark/DFlash draft checkpoint to MLA layout.
 
 Lossy warm-start: expand GQA KV → MHA, remap NeoX RoPE dims to interleaved
-MLA rope layout, pad/truncate nope/v dims, share k_rope, truncated SVD for
-Q/KV LoRA. Non-attention weights are copied as-is. config.json is rewritten
-with attention_type=mla and MLA dims.
+MLA rope layout, pad/truncate nope/v dims, share k_rope. By default uses
+dense Q and full-rank KV factorization (no LoRA truncation); pass
+``--q-lora-rank`` / ``--kv-lora-rank`` to compress. Non-attention weights
+are copied as-is. config.json is rewritten with attention_type=mla.
 
 Example:
     python scripts/convert_dspark_gqa_to_mla.py \\
         ./output/dspark_gqa/checkpoints/5 \\
         -o ./output/dspark_mla_init
 
+    # Optional: compress to match a verifier MLA geometry
     python scripts/convert_dspark_gqa_to_mla.py ./gqa_ckpt -o ./mla_ckpt \\
         --q-lora-rank 2048 --kv-lora-rank 512 \\
         --qk-nope-head-dim 192 --qk-rope-head-dim 64 --v-head-dim 256
@@ -198,9 +200,18 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input_path", type=Path, help="GQA Speculators checkpoint dir")
     p.add_argument("-o", "--output-path", type=Path, required=True, help="Output MLA checkpoint dir")
-    p.add_argument("--q-lora-rank", type=int, default=None, help="Q LoRA rank (default: min(1536, H*qk))")
-    p.add_argument("--no-q-lora", action="store_true", help="Use dense q_proj")
-    p.add_argument("--kv-lora-rank", type=int, default=None, help="KV LoRA rank (default: min(512, …))")
+    p.add_argument(
+        "--q-lora-rank",
+        type=int,
+        default=None,
+        help="Q LoRA rank; omit for dense q_proj (default, no Q compression)",
+    )
+    p.add_argument(
+        "--kv-lora-rank",
+        type=int,
+        default=None,
+        help="KV LoRA rank (default: full H*(nope+v), no SVD truncation)",
+    )
     p.add_argument("--qk-nope-head-dim", type=int, default=None)
     p.add_argument("--qk-rope-head-dim", type=int, default=None)
     p.add_argument("--v-head-dim", type=int, default=None)
@@ -228,13 +239,11 @@ def main() -> None:
     v_dim = args.v_head_dim if args.v_head_dim is not None else head_dim
     if rope <= 0 or rope > head_dim or rope % 2:
         raise SystemExit(f"Invalid qk_rope_head_dim={rope} for head_dim={head_dim}")
-    kv_rank = args.kv_lora_rank if args.kv_lora_rank is not None else min(512, num_heads * (nope + v_dim))
-    if args.no_q_lora:
-        q_rank = None
-    elif args.q_lora_rank is not None:
-        q_rank = args.q_lora_rank
-    else:
-        q_rank = min(1536, num_heads * (nope + rope))
+
+    # Default: no compression — dense Q + full-rank KV factorization.
+    max_kv_rank = num_heads * (nope + v_dim)
+    kv_rank = args.kv_lora_rank if args.kv_lora_rank is not None else max_kv_rank
+    q_rank = args.q_lora_rank  # None → dense q_proj
 
     print(
         f"MLA dims: q_lora={q_rank} kv_lora={kv_rank} "
