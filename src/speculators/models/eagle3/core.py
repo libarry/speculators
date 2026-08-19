@@ -28,26 +28,20 @@ from speculators.proposals.greedy import GreedyTokenProposalConfig
 _EPS = 1e-5
 
 
-def _sp_scale_loss(s_loss: torch.Tensor, s_denom: torch.Tensor) -> torch.Tensor:
-    """Scale per-rank loss so SP gradient SUM equals the global-loss gradient.
+def _sp_loss_scale_factor(s_denom: torch.Tensor) -> torch.Tensor:
+    """``(D_local + eps) / (D_global + eps)`` so SP SUM of scaled loss is global.
 
-    Each rank computes ``s_loss = S_local / (D_local + _EPS)`` where ``S_local``
-    is the local elementwise-loss sum and ``D_local`` the local masked-token
-    count.  The global loss is ``S_global / (D_global + _EPS)`` with
-    ``S_global = Σ_r S_r`` and ``D_global = Σ_r D_r``.
-
-    Scaling ``s_loss`` by ``(D_local + _EPS) / (D_global + _EPS)`` yields
-    ``S_local / (D_global + _EPS)``; summing gradients across SP ranks then
-    gives the exact global-loss gradient (trainer uses SUM, not AVG).
-
-    When SP is disabled this is a no-op returning ``s_loss`` unchanged.
+    Each rank computes ``s_loss = S_local / (D_local + _EPS)``.  Multiplying by
+    this factor yields ``S_local / (D_global + _EPS)``; summing across SP ranks
+    (trainer uses SUM, not AVG) matches the global-loss gradient *and* the
+    logged mean.  Identity when SP is disabled.
     """
     try:
         from speculators.train.sequence_parallel.ulysses import ulysses_enabled
     except ImportError:
-        return s_loss
+        return s_denom.new_ones(())
     if not ulysses_enabled():
-        return s_loss
+        return s_denom.new_ones(())
 
     import torch.distributed as dist
 
@@ -55,8 +49,28 @@ def _sp_scale_loss(s_loss: torch.Tensor, s_denom: torch.Tensor) -> torch.Tensor:
 
     s_denom_global = s_denom.detach().clone()
     dist.all_reduce(s_denom_global, op=dist.ReduceOp.SUM, group=get_sp_group())
-    scale = (s_denom + _EPS) / (s_denom_global + _EPS)
-    return s_loss * scale
+    return (s_denom + _EPS) / (s_denom_global + _EPS)
+
+
+def _sp_scale_loss(s_loss: torch.Tensor, s_denom: torch.Tensor) -> torch.Tensor:
+    """Scale per-rank loss so SP gradient SUM equals the global-loss gradient."""
+    return s_loss * _sp_loss_scale_factor(s_denom)
+
+
+def _accumulate_sp_scaled_step(
+    loss: torch.Tensor,
+    metrics: dict,
+    s_loss: torch.Tensor,
+    s_metrics: dict,
+    s_denom: torch.Tensor,
+) -> torch.Tensor:
+    """Add one TTT-step loss; scale mean ``*_sum`` metrics the same way as ``loss``."""
+    scale = _sp_loss_scale_factor(s_denom)
+    for key, value in s_metrics.items():
+        if key.endswith("_sum") and "acc" not in key:
+            s_metrics[key] = value * scale
+    metrics.update(s_metrics)
+    return loss + s_loss * scale
 
 
 @SpeculatorModel.register("eagle3")
@@ -406,8 +420,9 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                     chunk_size=logits_chunk_size,
                     norm_output=self.config.norm_output,
                 )
-                loss += _sp_scale_loss(s_loss, s_denom)
-                metrics.update(s_metrics)
+                loss = _accumulate_sp_scaled_step(
+                    loss, metrics, s_loss, s_metrics, s_denom
+                )
             else:
                 if self.config.norm_output:
                     hidden_states = self.norm(hidden_states)
@@ -427,8 +442,9 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                         ttt_step_loss_decay,
                         loss_config=loss_config,
                     )
-                    loss += _sp_scale_loss(s_loss, s_denom)
-                    metrics.update(s_metrics)
+                    loss = _accumulate_sp_scaled_step(
+                        loss, metrics, s_loss, s_metrics, s_denom
+                    )
 
                 input_ids = torch.argmax(logits, dim=-1)
 

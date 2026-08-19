@@ -29,6 +29,7 @@ from speculators.train.checkpointer import (
 from speculators.train.distributed import (
     apply_fully_sharded,
     get_dp_group,
+    get_dp_size,
     get_local_rank,
     get_rank,
     get_sp_group,
@@ -37,7 +38,10 @@ from speculators.train.distributed import (
 )
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
-from speculators.train.utils import normalize_counted_metrics
+from speculators.train.utils import (
+    normalize_counted_metrics,
+    scale_replica_totals_for_sp,
+)
 
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
@@ -509,15 +513,22 @@ class Trainer:
 
             profile = None
             if timer.enabled:
-                num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
-                profile = timer.profile(num_tokens)
+                num_tokens_t = (gpu_batch["document_ids"] != -1).sum().clone()
+                if get_sp_size() > 1:
+                    dist.all_reduce(
+                        num_tokens_t, op=dist.ReduceOp.SUM, group=get_sp_group()
+                    )
+                profile = timer.profile(int(num_tokens_t.item()))
+                scale_replica_totals_for_sp(metrics, get_sp_size())
                 if self.is_distributed:
                     for v in metrics.values():
                         dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
 
                 metrics = {k: v.item() for k, v in metrics.items()}
-                world_size = dist.get_world_size() if self.is_distributed else 1
-                metrics = normalize_counted_metrics(metrics, world_size)
+                # Average leftover (non sum/total) keys over DP replicas only;
+                # SP shards of one sequence must not divide the logged mean by sp_size.
+                replica_count = get_dp_size() if self.is_distributed else 1
+                metrics = normalize_counted_metrics(metrics, replica_count)
                 lr_info = (
                     current_lrs
                     if len(current_lrs) > 1
@@ -585,6 +596,7 @@ class Trainer:
                     **gpu_batch, **(self.config.val_call_kwargs or {})
                 )
 
+            scale_replica_totals_for_sp(metrics, get_sp_size())
             for k, v in metrics.items():
                 acc = accumulated.get(k)
                 accumulated[k] = v.float() if acc is None else acc + v.float()
@@ -596,9 +608,9 @@ class Trainer:
                 dist.all_reduce(stacked, op=dist.ReduceOp.SUM)
             val_metrics = dict(zip(accumulated, stacked.tolist(), strict=True))
 
-        world_size = dist.get_world_size() if self.is_distributed else 1
+        replica_count = get_dp_size() if self.is_distributed else 1
         val_metrics = {k: v / num_batches for k, v in val_metrics.items()}
-        val_metrics = normalize_counted_metrics(val_metrics, world_size)
+        val_metrics = normalize_counted_metrics(val_metrics, replica_count)
         val_metrics = {f"{k}_epoch": v for k, v in val_metrics.items()}
 
         metric_logger.info(

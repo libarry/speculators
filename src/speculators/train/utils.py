@@ -2,6 +2,7 @@ import datetime
 import importlib.metadata
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -68,6 +69,38 @@ def resolve_mask_token_id(
     )
 
 
+# Per-replica means (``*_total = 1``), as opposed to token-count totals such as
+# ``full_acc_0_total``.  Under Ulysses SP every rank in an SP group shares one
+# packed sequence; WORLD-SUM of these replica weights would count the sequence
+# ``sp_size`` times unless they are scaled by ``1/sp_size`` before reduce.
+_REPLICA_TOTAL_RE = re.compile(
+    r"(?:^loss(?:_\d+)?_total$)|(?:_loss(?:_\d+)?_total$)"
+    r"|(?:^confidence_loss_total$)|(?:^eal_total$)"
+)
+
+
+def is_replica_weighted_total_key(key: str) -> bool:
+    """Return True if ``key`` is a per-replica ``*_total`` (not a token count)."""
+    return bool(_REPLICA_TOTAL_RE.search(key))
+
+
+def scale_replica_totals_for_sp(metrics: dict, sp_size: int) -> dict:
+    """In-place scale replica-weight ``*_total`` values by ``1/sp_size``.
+
+    After a WORLD ``ReduceOp.SUM``, ``loss_sum / loss_total`` then averages over
+    DP replicas only: SP ranks already contribute shards of one global loss
+    (see Eagle3 ``_sp_scale_loss``). Token-count totals are left unchanged so
+    accuracy stays ``correct / tokens`` across the full sequence.
+    """
+    if sp_size <= 1:
+        return metrics
+    inv = 1.0 / sp_size
+    for key, value in metrics.items():
+        if is_replica_weighted_total_key(key):
+            metrics[key] = value * inv
+    return metrics
+
+
 def normalize_counted_metrics(
     metrics: dict[str, float], world_size: int = 1
 ) -> dict[str, float]:
@@ -80,6 +113,9 @@ def normalize_counted_metrics(
 
     Any remaining metrics (not part of a sum/total pair) are divided
     by world_size to compute the average across ranks.
+
+    With sequence parallel, pass ``world_size=dp_size`` (not ``DP×SP``) and
+    call :func:`scale_replica_totals_for_sp` *before* the reduce.
     """
     normalized_keys: set[str] = set()
     for tk in [k for k in metrics if k.endswith("_total")]:
