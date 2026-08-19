@@ -603,13 +603,18 @@ def setup_root_logger(level="INFO"):
     This function sets up the root logger with a RichHandler for
     console output and adds the FormatDictFilter for better dictionary message
     formatting.
+
+    Override the level with ``SPECULATORS_LOG_LEVEL`` (e.g. ``DEBUG``) to see
+    per-rank SP diagnostics.
     """
+    level = os.environ.get("SPECULATORS_LOG_LEVEL", level)
     handler = RichHandler()
     handler.addFilter(FormatDictFilter())
     handler.addFilter(IsRank0Filter())
     logging.basicConfig(
         level=level, format="%(message)s", datefmt="[%X]", handlers=[handler]
     )
+    logging.getLogger("speculators").setLevel(level)
 
     # Disable verbose HTTP response logs from httpx
     logging.getLogger("httpx").propagate = False

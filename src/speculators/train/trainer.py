@@ -518,27 +518,25 @@ class Trainer:
             profile = None
             if timer.enabled:
                 num_tokens_t = (gpu_batch["document_ids"] != -1).sum().clone()
-                loss_mask_sum = (
-                    int(gpu_batch["loss_mask"].to(torch.bool).sum().item())
-                    if "loss_mask" in gpu_batch
-                    else -1
-                )
-                local_raw = {k: v.detach().item() for k, v in metrics.items()}
-                local_norm = normalize_counted_metrics(dict(local_raw), world_size=1)
-                print(
-                    f"[sp-debug] rank={get_rank()} sp_rank={get_sp_rank()} "
-                    f"dp_rank={get_dp_rank()} local_loss={float(loss.detach()):.6f} "
-                    f"loss_mask_sum={loss_mask_sum} "
-                    f"doc_tokens={int(num_tokens_t.item())} "
-                    f"local_metrics={local_norm}",
-                    flush=True,
-                )
-                root_logger.info(
-                    f"[sp-debug] rank={get_rank()} sp_rank={get_sp_rank()} "
-                    f"local_loss={float(loss.detach()):.6f} "
-                    f"loss_mask_sum={loss_mask_sum} local_metrics={local_norm}",
-                    extra={"override_rank0_filter": True},
-                )
+                if root_logger.isEnabledFor(logging.DEBUG):
+                    loss_mask_sum = (
+                        int(gpu_batch["loss_mask"].to(torch.bool).sum().item())
+                        if "loss_mask" in gpu_batch
+                        else -1
+                    )
+                    local_raw = {k: v.detach().item() for k, v in metrics.items()}
+                    local_norm = normalize_counted_metrics(
+                        dict(local_raw), world_size=1
+                    )
+                    root_logger.debug(
+                        f"[sp-debug] rank={get_rank()} sp_rank={get_sp_rank()} "
+                        f"dp_rank={get_dp_rank()} "
+                        f"local_loss={float(loss.detach()):.6f} "
+                        f"loss_mask_sum={loss_mask_sum} "
+                        f"doc_tokens={int(num_tokens_t.item())} "
+                        f"local_metrics={local_norm}",
+                        extra={"override_rank0_filter": True},
+                    )
                 if get_sp_size() > 1:
                     dist.all_reduce(
                         num_tokens_t, op=dist.ReduceOp.SUM, group=get_sp_group()
@@ -555,10 +553,9 @@ class Trainer:
                 replica_count = get_dp_size() if self.is_distributed else 1
                 metrics = normalize_counted_metrics(metrics, replica_count)
                 if get_rank() == 0:
-                    print(
+                    root_logger.debug(
                         f"[sp-debug-reduced] global_step={self.global_step} "
                         f"reduced_metrics={metrics}",
-                        flush=True,
                     )
                 lr_info = (
                     current_lrs
