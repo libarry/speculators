@@ -18,12 +18,11 @@ from speculators.train.data import (
     create_collate_fn,
     split_files,
 )
-from speculators.train.distributed import get_dp_rank, get_dp_size, get_sp_rank, get_sp_size
+from speculators.train.distributed import get_dp_rank, get_dp_size
 from speculators.train.distributed_batch_sampler import (
     MultipackDistributedBatchSamplerV2,
 )
 from speculators.train.noise_transforms import AddUniformNoise
-from speculators.train.sequence_parallel import pad_seq_to_sp_multiple, shard_batch_for_sp
 
 logger = logging.getLogger(__name__)
 
@@ -31,23 +30,13 @@ BatchType = dict[str, Any]
 
 
 def _wrap_collate_for_sp(collate_fn: Callable):
-    """Pad to sp multiple and slice the packed batch for this SP rank.
+    """Identity: SP pad/shard happens after an SP-group broadcast in the trainer.
 
-    All ranks in a DP group share the same multipack indices (same dp_rank),
-    each loads the full packed sequence, then keeps only its shard. This is
-    simple/correct for online training; slice-only I/O can come later.
+    Collate runs in dataloader workers where NCCL is unsafe. Each SP rank may
+    therefore pack a different (or empty) batch; :func:`sync_and_shard_sp_batch`
+    replaces that with rank-0's packed sequence before the model runs.
     """
-    sp_size = get_sp_size()
-    sp_rank = get_sp_rank()
-
-    def _collate(batch: list) -> BatchType:
-        collated = collate_fn(batch)
-        if sp_size <= 1:
-            return collated
-        collated = pad_seq_to_sp_multiple(collated, sp_size)
-        return shard_batch_for_sp(collated, sp_rank, sp_size)
-
-    return _collate
+    return collate_fn
 
 
 def _setup_dataloader(
@@ -110,9 +99,10 @@ def create_train_val_loaders(
     """Create training and validation DataLoaders.
 
     Handles dataset construction (legacy vs Arrow) and dataloader wiring.
-    Non-data SP ranks get lightweight loaders with no workers (they receive
-    batches via scatter).  Reads DP/SP topology from
-    :mod:`speculators.train.distributed`.
+    Sequence-parallel ranks share one packed batch via
+    :func:`~speculators.train.sequence_parallel.shard.sync_and_shard_sp_batch`
+    in the trainer (collate cannot NCCL-broadcast from worker processes).
+    Reads DP/SP topology from :mod:`speculators.train.distributed`.
     """
     noise_transform = AddUniformNoise(std=noise_std)
 

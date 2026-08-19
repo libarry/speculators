@@ -3,6 +3,7 @@
 from speculators.train.sequence_parallel.shard import (
     pad_seq_to_sp_multiple,
     shard_batch_for_sp,
+    sync_and_shard_sp_batch,
     validate_sp_head_divisibility,
 )
 from speculators.train.sequence_parallel.ulysses import (
@@ -16,6 +17,7 @@ __all__ = [
     "gather_document_ids",
     "pad_seq_to_sp_multiple",
     "shard_batch_for_sp",
+    "sync_and_shard_sp_batch",
     "ulysses_enabled",
     "validate_sp_head_divisibility",
 ]

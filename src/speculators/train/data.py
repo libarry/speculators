@@ -285,14 +285,11 @@ class ArrowDataset(BaseDataset):
         sp_size = get_sp_size()
         sp_rank = get_sp_rank()
 
-        # SP rank >0 must NOT issue redundant vLLM requests: sp_rank=0 of the
-        # same DP group generates and atomically writes the cache file for
-        # this index; rank >0 polls the cache until it appears (or times
-        # out). This eliminates sp_size× redundant vLLM traffic while keeping
-        # the dataloader workers free of any dist ops (which are unsafe
-        # across fork).
+        # SP rank >0 must NOT issue redundant vLLM requests. They do not wait
+        # on a cache file either (``--on-generate delete`` would never write one).
+        # The trainer broadcasts rank 0's packed batch across the SP group.
         if sp_size > 1 and sp_rank != 0:
-            return self._wait_for_sp_cache(self._map_to_file_idx(index))
+            return None
 
         # sp_size == 1 OR sp_rank == 0: original vLLM generation path.
         if not self.client:

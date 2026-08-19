@@ -288,11 +288,24 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
 
     @torch.compiler.disable
-    def _build_attention_mask(self, loss_mask, max_anchors, document_ids, device):
+    def _build_attention_mask(
+        self,
+        loss_mask,
+        max_anchors,
+        document_ids,
+        device,
+        *,
+        global_start: int = 0,
+        global_seq_len: int | None = None,
+    ):
         total_seq_len = loss_mask.shape[1]
 
         anchor_positions, anchor_valid = select_anchors(
-            loss_mask, max_anchors, self.block_size
+            loss_mask,
+            max_anchors,
+            self.block_size,
+            global_start=global_start,
+            global_seq_len=global_seq_len,
         )
 
         full_attn_mask = None
@@ -337,6 +350,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
         num_anchors = kwargs.pop("max_anchors", 3072)
+        sp_global_start = int(kwargs.pop("sp_global_start", 0) or 0)
+        sp_global_seq_len = kwargs.pop("sp_global_seq_len", None)
+        kwargs.pop("lengths", None)
+        if sp_global_seq_len is None:
+            sp_global_seq_len = total_seq_len
+        else:
+            sp_global_seq_len = int(sp_global_seq_len)
 
         if position_ids is None:
             position_ids = torch.arange(
@@ -344,7 +364,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             ).unsqueeze(0)
 
         full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
-            self._build_attention_mask(loss_mask, num_anchors, document_ids, device)
+            self._build_attention_mask(
+                loss_mask,
+                num_anchors,
+                document_ids,
+                device,
+                global_start=sp_global_start,
+                global_seq_len=sp_global_seq_len,
+            )
         )
 
         mask_tokens_size = num_anchors * self.block_size

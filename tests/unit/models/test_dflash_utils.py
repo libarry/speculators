@@ -57,3 +57,18 @@ class TestSelectAnchors:
         anchors, anchor_valid = select_anchors(loss_mask, num_anchors=8, block_size=4)
         selected = anchors[anchor_valid]
         assert torch.equal(selected, torch.sort(selected).values)
+
+    def test_sp_shard_keeps_mid_sequence_anchors(self):
+        # Local tail is no longer the only exclusion: a shard of completions
+        # in the middle of a long packed sequence must still yield anchors.
+        torch.manual_seed(0)
+        loss_mask = torch.ones(1, 32)
+        anchors, valid = select_anchors(
+            loss_mask,
+            num_anchors=4,
+            block_size=8,
+            global_start=64,
+            global_seq_len=256,
+        )
+        assert int(valid.sum().item()) == 4
+        assert int(anchors[valid].max().item()) <= 32 - 8

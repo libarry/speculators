@@ -122,6 +122,49 @@ def shard_batch_for_sp(
     return out
 
 
+def sync_and_shard_sp_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    """Broadcast the packed batch from SP rank 0, then pad and shard.
+
+    Collate runs independently per rank (and in dataloader workers, so it cannot
+    use NCCL). Rank 0 holds the real packed sequence; other SP ranks may have
+    empty placeholders. Ulysses requires every rank to shard the *same* sequence.
+    """
+    from speculators.train.distributed import (  # noqa: PLC0415
+        get_local_rank,
+        get_rank,
+        get_sp_group,
+        get_sp_rank,
+        get_sp_size,
+    )
+
+    import torch.distributed as dist  # noqa: PLC0415
+
+    sp_size = get_sp_size()
+    sp_rank = get_sp_rank()
+    if sp_size <= 1:
+        return batch
+
+    src = get_rank() - sp_rank
+    payload: list[Any] = [batch if sp_rank == 0 else None]
+    group = get_sp_group()
+    try:
+        acc = torch.accelerator.current_accelerator()
+        device = (
+            torch.device(acc.type, get_local_rank()) if acc is not None else None
+        )
+        dist.broadcast_object_list(payload, src=src, group=group, device=device)
+    except TypeError:
+        dist.broadcast_object_list(payload, src=src, group=group)
+
+    synced = payload[0]
+    if not isinstance(synced, dict):
+        raise RuntimeError(
+            "SP batch broadcast failed (got no packed batch from rank 0)"
+        )
+    synced = pad_seq_to_sp_multiple(synced, sp_size)
+    return shard_batch_for_sp(synced, sp_rank, sp_size)
+
+
 def validate_sp_head_divisibility(
     num_attention_heads: int,
     num_key_value_heads: int,

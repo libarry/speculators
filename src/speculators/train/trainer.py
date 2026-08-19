@@ -40,6 +40,7 @@ from speculators.train.distributed import (
 )
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
+from speculators.train.sequence_parallel.shard import sync_and_shard_sp_batch
 from speculators.train.utils import (
     normalize_counted_metrics,
     scale_replica_totals_for_sp,
@@ -482,6 +483,7 @@ class Trainer:
             timer.reset(self.global_step % self.config.log_freq == 0)
 
             timer.mark_value("start", t_before_fetch)
+            batch = sync_and_shard_sp_batch(batch)
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)
@@ -611,6 +613,7 @@ class Trainer:
         num_batches = len(val_loader)
         for i, batch in enumerate(val_loader):
             self._maybe_val_sync(i)
+            batch = sync_and_shard_sp_batch(batch)
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)
