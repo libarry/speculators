@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 
 __all__ = [
+    "apply_neox_rotary",
     "install_partial_neox_rotary",
     "partial_neox_apply_rotary_pos_emb",
 ]
@@ -22,6 +23,37 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., :half]
     x2 = x[..., half:]
     return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_neox_rotary(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> torch.Tensor:
+    """Apply NeoX RoPE to one Q/K tensor, with vLLM partial-rotary fallback.
+
+    - If ``cos`` covers full head dim, behavior matches HF ``apply_rotary_pos_emb``.
+    - If ``cos`` is shorter, rotate only the first ``rotary_dim`` channels and
+      keep the remaining channels unchanged.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    if cos.shape[-1] == x.shape[-1]:
+        return (x * cos) + (_rotate_half(x) * sin)
+
+    if cos.shape[-1] > x.shape[-1]:
+        raise ValueError(
+            f"cos last dim ({cos.shape[-1]}) exceeds q last dim "
+            f"({x.shape[-1]}); rotary tables larger than head_dim are "
+            "unsupported by this partial-neox replacement."
+        )
+
+    rotary_dim = cos.shape[-1]
+    x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
+    x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
+    return torch.cat([x_rot, x_pass], dim=-1)
 
 
 def partial_neox_apply_rotary_pos_emb(
@@ -37,33 +69,10 @@ def partial_neox_apply_rotary_pos_emb(
     - If ``cos`` is shorter, rotate only the first ``rotary_dim`` channels
       and keep the remaining channels unchanged.
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    if cos.shape[-1] == q.shape[-1]:
-        # Full rotation — identical to HF apply_rotary_pos_emb.
-        q_embed = (q * cos) + (_rotate_half(q) * sin)
-        k_embed = (k * cos) + (_rotate_half(k) * sin)
-        return q_embed, k_embed
-
-    if cos.shape[-1] > q.shape[-1]:
-        raise ValueError(
-            f"cos last dim ({cos.shape[-1]}) exceeds q last dim "
-            f"({q.shape[-1]}); rotary tables larger than head_dim are "
-            "unsupported by this partial-neox replacement."
-        )
-
-    rotary_dim = cos.shape[-1]
-    # Rotate leading rotary channels; keep tail as pass-through.
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-    q_rot = (q_rot * cos) + (_rotate_half(q_rot) * sin)
-    k_rot = (k_rot * cos) + (_rotate_half(k_rot) * sin)
-
-    q_embed = torch.cat([q_rot, q_pass], dim=-1)
-    k_embed = torch.cat([k_rot, k_pass], dim=-1)
-    return q_embed, k_embed
+    return (
+        apply_neox_rotary(q, cos, sin, unsqueeze_dim=unsqueeze_dim),
+        apply_neox_rotary(k, cos, sin, unsqueeze_dim=unsqueeze_dim),
+    )
 
 
 _PATCH_STATE = {"installed": False}

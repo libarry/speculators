@@ -7,7 +7,6 @@ from torch.nn.attention.flex_attention import create_block_mask, create_mask
 from transformers import PretrainedConfig
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RMSNorm,
-    Qwen3RotaryEmbedding,
 )
 
 from speculators.model import DraftVocabMixin, SpeculatorModel
@@ -15,7 +14,12 @@ from speculators.models.attention import create_float_mask
 from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.attention import create_anchor_block_mask_mod
 from speculators.models.dflash.metrics import compute_metrics
-from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
+from speculators.models.dflash.model_definitions import (
+    Qwen3DFlashDecoderLayer,
+    build_gqa_rotary_embedding,
+    resolve_head_dim,
+    resolve_partial_rotary_factor,
+)
 from speculators.models.dflash.utils import (
     get_base_indices_for_anchored_blocks,
     select_anchors,
@@ -95,7 +99,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
-        self.rotary_emb = Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
+        self.rotary_emb = build_gqa_rotary_embedding(config.transformer_layer_config)
+        partial = resolve_partial_rotary_factor(config.transformer_layer_config)
+        if 0.0 < partial < 1.0:
+            head_dim = resolve_head_dim(config.transformer_layer_config)
+            logger.info(
+                "DFlash GQA partial RoPE: head_dim=%d, "
+                "partial_rotary_factor=%s, rotary_dim=%d",
+                head_dim,
+                partial,
+                int(head_dim * partial),
+            )
 
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,

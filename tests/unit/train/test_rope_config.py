@@ -213,3 +213,31 @@ def test_pre_transformers_5_preserves_mrope_in_rope_scaling(patch_verifier):
     # Legacy fields should be stripped from rope_scaling too
     assert "type" not in config.rope_scaling
     assert "mrope_interleaved" not in config.rope_scaling
+
+
+def test_dflash_strips_mrope_section_and_keeps_partial(patch_verifier):
+    """DFlash serving cannot use M-RoPE; keep 1D partial rotary instead."""
+    vc = _make_verifier_config(
+        head_dim=256,
+        rope_parameters={
+            "rope_type": "default",
+            "type": "mrope",
+            "mrope_section": [8, 12, 12],
+            "mrope_interleaved": True,
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1000000.0,
+        },
+    )
+    patch_verifier(vc, "5.0.0")
+
+    config = _build(
+        mrope_full_head_hack=False,
+        strip_mrope_section=True,
+        draft_arch="qwen3",
+    )
+
+    assert "mrope_section" not in config.rope_parameters
+    assert "type" not in config.rope_parameters
+    assert config.rope_parameters["partial_rotary_factor"] == 0.25
+    assert config.rope_parameters["rope_theta"] == 1000000.0
+    assert int(config.head_dim * config.rope_parameters["partial_rotary_factor"]) == 64

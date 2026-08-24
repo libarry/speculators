@@ -550,6 +550,42 @@ def _capture_full_attention_indices(
     return captured["full_attention_indices"]
 
 
+def test_dflash_build_skips_full_head_hack_and_strips_mrope(monkeypatch):
+    """DFlash keeps verifier partial_rotary_factor and drops mrope_section."""
+    captured = {}
+
+    def _fake_create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(vocab_size=128)
+
+    monkeypatch.setattr("scripts.train.create_transformer_layer_config", _fake_create)
+    monkeypatch.setattr("scripts.train.resolve_mask_token_id", lambda *_a, **_k: 0)
+
+    class _FakeModel:
+        @classmethod
+        def from_training_args(cls, **_kwargs):
+            return "MODEL"
+
+    args = SimpleNamespace(
+        speculator_type="dflash",
+        from_pretrained="",
+        draft_config="",
+        verifier_name_or_path="some-verifier",
+        num_layers=3,
+        draft_arch="qwen3",
+        draft_hidden_act=None,
+        sliding_window=2048,
+        full_attention_indices=[],
+        mask_token_id=None,
+        trust_remote_code=False,
+        draft_mrope_full_head_hack=True,
+    )
+    build_draft_model(args, _FakeModel, None, None, 128)  # type: ignore[arg-type]
+
+    assert captured["mrope_full_head_hack"] is False
+    assert captured["strip_mrope_section"] is True
+
+
 @pytest.mark.parametrize(
     ("speculator_type", "requested_indices", "expected_indices"),
     [

@@ -106,9 +106,11 @@ class DraftArgs(_Group):
     )
     draft_mrope_full_head_hack: bool = Field(
         default=True,
-        description="For MRoPE configs with partial_rotary_factor < 1, rescale "
-        "mrope_section and set partial_rotary_factor=1.0 so HF training and vLLM "
-        "inference use equivalent full-head rotary semantics.",
+        description="For Eagle3/P-EAGLE MRoPE configs with partial_rotary_factor < 1, "
+        "rescale mrope_section and set partial_rotary_factor=1.0 so HF training and "
+        "vLLM inference use equivalent full-head rotary semantics. Ignored for "
+        "DFlash/DSpark, which train native vLLM-style partial RoPE and keep the "
+        "verifier's partial_rotary_factor.",
     )
     target_layer_ids: list[int] | None = Field(
         default=None,

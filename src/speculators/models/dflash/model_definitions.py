@@ -1,4 +1,5 @@
-from typing import TYPE_CHECKING
+import copy
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -10,20 +11,75 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Config,
     Qwen3MLP,
     Qwen3RMSNorm,
+    Qwen3RotaryEmbedding,
     eager_attention_forward,
 )
 from typing_extensions import Unpack
+
+from speculators.models.eagle3.rotary_partial import apply_neox_rotary
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-# Local copy of rotate_half to avoid dependency on internal transformers functions
-def _rotate_half(x):
-    """Rotates half the hidden dims of the input (local implementation)."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+def _rope_params_attr(config: Any) -> tuple[str | None, dict]:
+    for attr in ("rope_parameters", "rope_scaling"):
+        value = getattr(config, attr, None)
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            return attr, value
+        if hasattr(value, "to_dict"):
+            return attr, dict(value.to_dict())
+        try:
+            return attr, dict(value)
+        except (TypeError, ValueError):
+            continue
+    return None, {}
+
+
+def resolve_partial_rotary_factor(config: Any) -> float:
+    """Read ``partial_rotary_factor`` from rope params, defaulting to full-head."""
+    _, params = _rope_params_attr(config)
+    if "partial_rotary_factor" in params:
+        return float(params["partial_rotary_factor"])
+    return float(getattr(config, "partial_rotary_factor", 1.0) or 1.0)
+
+
+def resolve_head_dim(config: Any) -> int:
+    return int(
+        getattr(config, "head_dim", None)
+        or config.hidden_size // config.num_attention_heads
+    )
+
+
+def build_gqa_rotary_embedding(config: Any) -> Qwen3RotaryEmbedding:
+    """Build Qwen3 RoPE tables whose last dim matches vLLM ``rotary_dim``.
+
+    HF ``Qwen3RotaryEmbedding`` ignores ``partial_rotary_factor`` on the
+    default rope path and always emits full ``head_dim`` cos/sin. When the
+    verifier uses partial rotary (e.g. Qwen3.5 ``0.25``), shrink the rotary
+    module's ``head_dim`` so training rotates the same leading channels as
+    vLLM inference. YaRN already scales by ``partial_rotary_factor``; the
+    copy sets that factor to 1.0 so it is not applied twice.
+    """
+    head_dim = resolve_head_dim(config)
+    partial = resolve_partial_rotary_factor(config)
+    if not 0.0 < partial < 1.0:
+        return Qwen3RotaryEmbedding(config)
+
+    rotary_dim = int(head_dim * partial)
+    if rotary_dim <= 0 or rotary_dim > head_dim:
+        return Qwen3RotaryEmbedding(config)
+
+    rotary_config = copy.deepcopy(config)
+    rotary_config.head_dim = rotary_dim
+    attr, params = _rope_params_attr(rotary_config)
+    if attr is not None:
+        params = dict(params)
+        params["partial_rotary_factor"] = 1.0
+        setattr(rotary_config, attr, params)
+    return Qwen3RotaryEmbedding(rotary_config)
 
 
 def apply_rotary_pos_emb(
@@ -34,13 +90,18 @@ def apply_rotary_pos_emb(
     position_ids=None,  # noqa: ARG001
     unsqueeze_dim=1,
 ):
-    """Apply rotary position embeddings (local implementation)."""
+    """Apply rotary embeddings, including vLLM-style partial NeoX RoPE.
 
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
+    Query tokens sit at the tail of the concatenated context+mask sequence, so
+    Q is rotated with the last ``q_len`` position tables. K uses the full
+    tables. When ``cos`` is shorter than ``head_dim``, only the leading
+    ``rotary_dim`` channels are rotated.
+    """
     q_len = q.size(-2)
-    q_embed = (q * cos[..., -q_len:, :]) + (_rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    q_embed = apply_neox_rotary(
+        q, cos[..., -q_len:, :], sin[..., -q_len:, :], unsqueeze_dim=unsqueeze_dim
+    )
+    k_embed = apply_neox_rotary(k, cos, sin, unsqueeze_dim=unsqueeze_dim)
     return q_embed, k_embed
 
 

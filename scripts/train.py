@@ -103,6 +103,31 @@ def _maybe_apply_mrope_full_head_hack(
         )
 
 
+def _sanitize_draft_rope_params(
+    rope_params: dict,
+    resolved_head_dim: int,
+    mrope_full_head_hack: bool,
+    strip_mrope_section: bool,
+) -> None:
+    """Normalize inherited RoPE fields for the draft decoder config."""
+    _maybe_apply_mrope_full_head_hack(
+        rope_params, resolved_head_dim, mrope_full_head_hack
+    )
+    # ``type`` is a legacy alias (only "mrope" on VL models) that
+    # transformers strips during validation and that breaks vLLM's
+    # config checks; drop it while keeping the real MRoPE fields unless
+    # the caller asked to strip M-RoPE for draft-model spec decode.
+    rope_params.pop("type", None)
+    rope_params.pop("mrope_interleaved", None)
+    if strip_mrope_section:
+        rope_params.pop("mrope_section", None)
+    # The Llama/Qwen3 draft does not support partial rotary unless the
+    # algorithm implements it (DFlash GQA). Drop the factor for other
+    # drafts when it is not needed to describe M-RoPE sections.
+    if "mrope_section" not in rope_params and not strip_mrope_section:
+        rope_params.pop("partial_rotary_factor", None)
+
+
 def create_transformer_layer_config(  # noqa: C901
     verifier_name_or_path: str,
     num_layers: int,
@@ -111,6 +136,7 @@ def create_transformer_layer_config(  # noqa: C901
     sliding_window: int,
     full_attention_indices: list[int],
     mrope_full_head_hack: bool = True,
+    strip_mrope_section: bool = False,
 ) -> PretrainedConfig:
     if draft_arch not in DRAFT_ARCH_CONFIGS:
         raise ValueError(
@@ -210,33 +236,23 @@ def create_transformer_layer_config(  # noqa: C901
                     rope_params = {"rope_type": "default", "rope_theta": 10000.0}
 
             if isinstance(rope_params, dict):
-                _maybe_apply_mrope_full_head_hack(
-                    rope_params, resolved_head_dim, mrope_full_head_hack
+                _sanitize_draft_rope_params(
+                    rope_params,
+                    resolved_head_dim,
+                    mrope_full_head_hack,
+                    strip_mrope_section,
                 )
-                # ``type`` is a legacy alias (only "mrope" on VL models) that
-                # transformers strips during validation and that breaks vLLM's
-                # config checks; drop it while keeping the real MRoPE fields.
-                rope_params.pop("type", None)
-                rope_params.pop("mrope_interleaved", None)
-                # The verifier (e.g. Mistral) may use partial rotary embeddings,
-                # but the draft model doesn't support partial_rotary_factor.
-                # Only keep it for MRoPE configs that need it.
-                if "mrope_section" not in rope_params:
-                    rope_params.pop("partial_rotary_factor", None)
             config.rope_parameters = rope_params
     else:
         if hasattr(verifier_config, "rope_scaling"):
             rope_scaling = deepcopy(verifier_config.rope_scaling)
             if isinstance(rope_scaling, dict):
-                _maybe_apply_mrope_full_head_hack(
-                    rope_scaling, resolved_head_dim, mrope_full_head_hack
+                _sanitize_draft_rope_params(
+                    rope_scaling,
+                    resolved_head_dim,
+                    mrope_full_head_hack,
+                    strip_mrope_section,
                 )
-                # Strip legacy fields for consistency with rope_parameters path
-                rope_scaling.pop("type", None)
-                rope_scaling.pop("mrope_interleaved", None)
-                # Same partial_rotary_factor guard as the rope_parameters path.
-                if "mrope_section" not in rope_scaling:
-                    rope_scaling.pop("partial_rotary_factor", None)
             config.rope_scaling = rope_scaling
         config.rope_theta = getattr(verifier_config, "rope_theta", 10000.0)
 
@@ -481,6 +497,13 @@ def build_draft_model(
                     args.sliding_window,
                 )
 
+            dflash_family = args.speculator_type in ("dflash", "dspark")
+            if dflash_family and args.draft_mrope_full_head_hack:
+                logger.info(
+                    "DFlash/DSpark implement native partial RoPE; skipping "
+                    "the MRoPE full-head hack so verifier "
+                    "partial_rotary_factor is preserved."
+                )
             transformer_layer_config = create_transformer_layer_config(
                 verifier_name_or_path=args.verifier_name_or_path,
                 num_layers=args.num_layers,
@@ -488,7 +511,10 @@ def build_draft_model(
                 hidden_act=args.draft_hidden_act,
                 sliding_window=args.sliding_window,
                 full_attention_indices=full_attention_indices,
-                mrope_full_head_hack=args.draft_mrope_full_head_hack,
+                mrope_full_head_hack=(
+                    False if dflash_family else args.draft_mrope_full_head_hack
+                ),
+                strip_mrope_section=dflash_family,
             )
 
         args.mask_token_id = resolve_mask_token_id(
